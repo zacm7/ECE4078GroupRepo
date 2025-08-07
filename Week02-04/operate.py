@@ -200,7 +200,7 @@ class Operate:
             ########### replace with your M1 codes ###########
             # drive forward
             if event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
-                self.command['motion'] = [10, 0]  # drive forward: linear=10, angular=0
+                self.command['motion'] = [5, 0]  # drive forward: linear=10, angular=0
             # drive backward
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
                 self.command['motion'] = [-10, 0]  # drive backward: linear=-10, angular=0
