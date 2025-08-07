@@ -7,7 +7,7 @@ import os
 import sys
 
 sys.path.append("../util")
-from pibot import PenguinPi
+from util.pibot import PenguinPi
 import pygame
 
 class calibration:

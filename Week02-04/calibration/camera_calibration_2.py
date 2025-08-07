@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 img = cv2.imread('./images/calib_0.png', cv2.IMREAD_GRAYSCALE)
 pts = []
 def onclick(event):
-    if event.button == 1 and len(pts) < 8:
+    if event.button == 1 and len(pts) < 12:
         pts.append((event.xdata, event.ydata))
         print(f"Point {len(pts)}: {pts[-1]}")
 
@@ -20,7 +20,7 @@ plt.title("Click 8 rig corners (left‑click); close when done")
 plt.show()
 fig.canvas.mpl_disconnect(cid)
 
-if len(pts) != 8:
+if len(pts) != 12:
     raise RuntimeError(f"Expected 8 points, got {len(pts)}")
 
 image_points = np.array(pts, dtype=np.float32)
@@ -28,14 +28,18 @@ image_points = np.array(pts, dtype=np.float32)
 # We assume the rig is set up in default configuration as shown in README
 cm = 0.01
 object_points = np.array([
-    [ 0,  -12.2, 12.2],
-    [ 0,   -6.2, 12.2],
-    [ 0,  -12.2,  6.2],
-    [ 0,   -6.2,  6.2],
-    [ 6.2,   0,  12.2],
-    [12.2,   0,  12.2],
-    [ 6.2,   0,   6.2],
-    [12.2,   0,   6.2],
+    [ 0,  -12.4, 12.4],
+    [ 0,   -6.4, 12.4],
+    [ 0,  -12.4,  6.4],
+    [ 0,   -6.4,  6.4],
+    [ 6.2,   0,  12.35],
+    [12.2,   0,  12.35],
+    [ 6.2,   0,   6.35],
+    [12.2,   0,   6.35],
+    [6.3, -12.35, 0],
+    [6.3,  -6.35, 0],
+    [12.3, -12.35, 0],
+    [12.3,  -6.35, 0],
 ], dtype=np.float32) * cm
 
 obj_pts_list = [object_points]

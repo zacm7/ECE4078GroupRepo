@@ -2,8 +2,8 @@
 import numpy as np
 import os
 import sys
-sys.path.insert(0, "../util")
-from pibot import PenguinPi
+# sys.path.insert(0, "../util")
+from util.pibot import PenguinPi
 
 
 
@@ -106,6 +106,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", metavar='', type=str, default='localhost')
     parser.add_argument("--port", metavar='', type=int, default=40000)
+    
     args, _ = parser.parse_known_args()
 
     ppi = PenguinPi(args.ip,args.port)
