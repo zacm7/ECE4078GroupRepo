@@ -86,16 +86,21 @@ class EKF:
 
     # the prediction step of EKF
     def predict(self, raw_drive_meas):
-
+    # TODO: add your codes here to complete the prediction step (implemented below)
         F = self.state_transition(raw_drive_meas)
-        x = self.get_state_vector()
-
-        # TODO: add your codes here to complete the prediction step
+        # Propagate robot pose using its motion model
+        self.robot.drive(raw_drive_meas)
+        # Wrap heading to [-pi, pi]
+        self.robot.state[2,0] = (self.robot.state[2,0] + np.pi) % (2*np.pi) - np.pi
+        # Covariance propagation
+        Q = self.predict_covariance(raw_drive_meas)
+        self.P = F @ self.P @ F.T + Q
 
     # the update step of EKF
     def update(self, measurements):
         if not measurements:
             return
+    # TODO: add your codes here to compute the updated x (implemented below)
 
         # Construct measurement index list
         tags = [lm.tag for lm in measurements]
@@ -107,14 +112,27 @@ class EKF:
         for i in range(len(measurements)):
             R[2*i:2*i+2,2*i:2*i+2] = measurements[i].covariance
 
-        # Compute own measurements
+        # Compute expected measurements from current state
         z_hat = self.robot.measure(self.markers, idx_list)
         z_hat = z_hat.reshape((-1,1),order="F")
         H = self.robot.derivative_measure(self.markers, idx_list)
 
         x = self.get_state_vector()
-
-        # TODO: add your codes here to compute the updated x
+        # Innovation
+        y = z - z_hat
+        # Innovation covariance
+        S = H @ self.P @ H.T + R
+        # Kalman gain
+        K = self.P @ H.T @ np.linalg.inv(S)
+        # State update
+        x = x + K @ y
+        # Covariance update (simple form)
+        I = np.eye(self.P.shape[0])
+        self.P = (I - K @ H) @ self.P
+        # Set state back (robot + landmarks)
+        self.set_state_vector(x)
+        # Wrap heading
+        self.robot.state[2,0] = (self.robot.state[2,0] + np.pi) % (2*np.pi) - np.pi
 
 
     def state_transition(self, raw_drive_meas):
