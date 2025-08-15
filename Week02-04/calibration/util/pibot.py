@@ -19,7 +19,9 @@ class PenguinPi:
     # turning_tick = turning speed
     ########################################## 
     def set_velocity(self, command, tick=50, turning_tick=20, time=0):
+        
         # running in sim
+       
         if self.ip == 'localhost': 
             l_vel = command[0]*tick - command[1]*turning_tick
             r_vel = command[0]*tick + command[1]*turning_tick
@@ -27,6 +29,7 @@ class PenguinPi:
         else:
             l_vel = command[0]*tick - command[1]*turning_tick
             r_vel = -command[0]*tick - command[1]*turning_tick # reverse right wheel velocity
+            #print(l_vel,r_vel)
         self.wheel_vel = [l_vel, r_vel]
         if time == 0:
             requests.get(
