@@ -157,7 +157,7 @@ class EKF:
             return
 
         th = float(self.robot.state[2])
-        c, s = np.cos(th), np.sin(th)
+        c, s = np.cos(th), np.sin(th) #renamed
         R_theta = np.array([[c, -s],
                             [s,  c]])
         robot_xy = self.robot.state[0:2, :]
@@ -167,7 +167,7 @@ class EKF:
                 continue
 
             # Landmark position in robot frame → inertial frame
-            z = lm.position.reshape(2, 1)
+            z = lm.position.reshape(2, 1) #renamed
             lm_inertial = robot_xy + R_theta @ z
 
             self.taglist.append(int(lm.tag))
