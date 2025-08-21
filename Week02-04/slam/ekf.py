@@ -156,21 +156,23 @@ class EKF:
         if not measurements:
             return
 
-        th = self.robot.state[2]
-        robot_xy = self.robot.state[0:2,:]
-        R_theta = np.block([[np.cos(th), -np.sin(th)],[np.sin(th), np.cos(th)]])
+        th = float(self.robot.state[2])
+        c, s = np.cos(th), np.sin(th)
+        R_theta = np.array([[c, -s],
+                            [s,  c]])
+        robot_xy = self.robot.state[0:2, :]
 
-        # Add new landmarks to the state
         for lm in measurements:
             if lm.tag in self.taglist:
-                # ignore known tags
                 continue
-            
-            lm_bff = lm.position.reshape(2,1) #added reshape
-            lm_inertial = robot_xy + R_theta @ lm_bff
+
+            # Landmark position in robot frame → inertial frame
+            z = lm.position.reshape(2, 1)
+            lm_inertial = robot_xy + R_theta @ z
 
             self.taglist.append(int(lm.tag))
             self.markers = np.concatenate((self.markers, lm_inertial), axis=1)
+
 
             # ADDED --------------------------
             zx, zy = float(z[0]), float(z[1])
