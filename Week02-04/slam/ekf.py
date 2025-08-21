@@ -126,9 +126,14 @@ class EKF:
         K = self.P @ H.T @ np.linalg.inv(S)
         # State update
         x = x + K @ y
-        # Covariance update (simple form)
+        # Covariance update (Joseph form)
         I = np.eye(self.P.shape[0])
-        self.P = (I - K @ H) @ self.P
+        # self.P = (I - K @ H) @ self.P - original line
+        # ADDED ----------------------------------------
+        IKH = I - K @ H
+        self.P = IKH @ self.P @ IKH.T + K @ R @ K.T
+        self.P = 0.5 * (self.P + self.P.T)  # ensure symmetry
+        # -----------------------------------------------
         # Set state back (robot + landmarks)
         self.set_state_vector(x)
         # Wrap heading
@@ -161,17 +166,45 @@ class EKF:
                 # ignore known tags
                 continue
             
-            lm_bff = lm.position
+            lm_bff = lm.position.reshape(2,1) #added reshape
             lm_inertial = robot_xy + R_theta @ lm_bff
 
             self.taglist.append(int(lm.tag))
             self.markers = np.concatenate((self.markers, lm_inertial), axis=1)
 
-            # Create a simple, large covariance to be fixed by the update step
-            self.P = np.concatenate((self.P, np.zeros((2, self.P.shape[1]))), axis=0)
-            self.P = np.concatenate((self.P, np.zeros((self.P.shape[0], 2))), axis=1)
-            self.P[-2,-2] = self.init_lm_cov**2
-            self.P[-1,-1] = self.init_lm_cov**2
+            # ADDED --------------------------
+            zx, zy = float(z[0]), float(z[1])
+            # d(landmark)/d(robot_state)
+            Jx = np.array([[1, 0, -s*zx - c*zy],
+                        [0, 1,  c*zx - s*zy]])
+            # d(landmark)/d(measurement)
+            Jz = R_theta
+
+            # --- Existing covariance sub‑blocks ---
+            P_rr = self.P[0:3, 0:3]   # robot‑robot
+            P_rO = self.P[0:3, 3:]    # robot‑otherLMs
+            P_Or = P_rO.T
+
+            # --- New covariance terms ---
+            P_ll = Jx @ P_rr @ Jx.T + Jz @ lm.covariance @ Jz.T   # landmark‑landmark
+            P_rl = P_rr @ Jx.T                                   # robot‑landmark
+            P_Ol = P_Or @ Jx.T                                   # otherLMs‑landmark
+
+            # --- Augment P ---
+            n = self.P.shape[0]
+            top    = np.concatenate((self.P, np.zeros((n, 2))), axis=1)
+            newcol = np.vstack((P_rl, P_Ol))
+            bottom = np.concatenate((newcol.T, P_ll), axis=1)
+            self.P = np.vstack((top, bottom))
+            self.P = 0.5 * (self.P + self.P.T)  # enforce symmetry
+
+            # -----------------------------------------------
+
+            # # Create a simple, large covariance to be fixed by the update step
+            # self.P = np.concatenate((self.P, np.zeros((2, self.P.shape[1]))), axis=0)
+            # self.P = np.concatenate((self.P, np.zeros((self.P.shape[0], 2))), axis=1)
+            # self.P[-2,-2] = self.init_lm_cov**2
+            # self.P[-1,-1] = self.init_lm_cov**2
 
     ##########################################
     ##########################################
