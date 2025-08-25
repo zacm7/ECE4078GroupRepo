@@ -63,7 +63,10 @@ class Operate:
         # a 5min timer
         self.count_down = 300
         self.start_time = time.time()
-        self.control_clock = time.time()
+        # high-resolution control clock and simple dt clamp settings
+        self.control_clock = time.perf_counter()
+        self._max_dt = 0.25           # seconds; clamp unusually large dt spikes
+        self._default_dt = 1.0/15.0   # fallback dt if spike detected
         # initialise images
         self.img = np.zeros([240,320,3], dtype=np.uint8)
         self.aruco_img = np.zeros([240,320,3], dtype=np.uint8)
@@ -78,14 +81,18 @@ class Operate:
                 self.command['motion'])
         if not self.data is None:
             self.data.write_keyboard(lv, rv)
-        dt = time.time() - self.control_clock
+        # high-resolution dt with spike clamp
+        now = time.perf_counter()
+        dt = now - self.control_clock
+        if not (0.0 < dt <= self._max_dt):
+            dt = self._default_dt
         # running in sim
         if args.ip == 'localhost':
             drive_meas = measure.Drive(lv, rv, dt)
         # running on physical robot (right wheel reversed)
         else:
             drive_meas = measure.Drive(lv, -rv, dt)
-        self.control_clock = time.time()
+        self.control_clock = now
         return drive_meas
         
     # camera control
