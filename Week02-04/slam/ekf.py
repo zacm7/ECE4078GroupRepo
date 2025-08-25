@@ -78,7 +78,7 @@ class EKF:
                 return True
             else:
                 return False
-
+        
     ##########################################
     # EKF functions
     # Tune your SLAM algorithm here
@@ -86,6 +86,7 @@ class EKF:
 
     # the prediction step of EKF
     def predict(self, raw_drive_meas):
+    # TODO: add your codes here to complete the prediction step (implemented below)
         F = self.state_transition(raw_drive_meas)
         # Propagate robot pose using its motion model
         self.robot.drive(raw_drive_meas)
@@ -99,6 +100,7 @@ class EKF:
     def update(self, measurements):
         if not measurements:
             return
+    # TODO:(Already Done) add your codes here to compute the updated x (implemented below)
 
         # Construct measurement index list
         tags = [lm.tag for lm in measurements]
@@ -163,9 +165,12 @@ class EKF:
         x = x + K @ y
         # Covariance update (Joseph form)
         I = np.eye(self.P.shape[0])
+        # self.P = (I - K @ H) @ self.P - original line
+        # ADDED ----------------------------------------
         IKH = I - K @ H
         self.P = IKH @ self.P @ IKH.T + K @ R @ K.T
         self.P = 0.5 * (self.P + self.P.T)  # ensure symmetry
+        # -----------------------------------------------
         # Set state back (robot + landmarks)
         self.set_state_vector(x)
         # Wrap heading
