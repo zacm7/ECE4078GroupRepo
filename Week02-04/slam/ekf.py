@@ -103,12 +103,13 @@ class EKF:
         # Outlier rejection using Mahalanobis distance
         inlier_measurements = []
         inlier_idx_list = []
+        R_SCALE = 3.0  # scale measurement covariance to reduce overconfidence
         for lm in measurements:
             idx = self.taglist.index(lm.tag)
             z = lm.position.reshape(-1,1)
             z_hat = self.robot.measure(self.markers, [idx]).reshape(-1,1)
             H = self.robot.derivative_measure(self.markers, [idx])
-            S = H @ self.P @ H.T + lm.covariance
+            S = H @ self.P @ H.T + (lm.covariance * R_SCALE)
             y = z - z_hat
             d2 = float(y.T @ np.linalg.inv(S) @ y)
             threshold = 9.21  # 99% confidence for 2D
@@ -122,7 +123,7 @@ class EKF:
         z = np.concatenate([lm.position.reshape(-1,1) for lm in inlier_measurements], axis=0)
         R = np.zeros((2*len(inlier_measurements),2*len(inlier_measurements)))
         for i in range(len(inlier_measurements)):
-            R[2*i:2*i+2,2*i:2*i+2] = inlier_measurements[i].covariance
+            R[2*i:2*i+2,2*i:2*i+2] = inlier_measurements[i].covariance * R_SCALE
 
         # Compute expected measurements from current state
         z_hat = self.robot.measure(self.markers, inlier_idx_list)
@@ -158,7 +159,7 @@ class EKF:
     def predict_covariance(self, raw_drive_meas):
         n = self.number_landmarks()*2 + 3
         Q = np.zeros((n,n))
-        Q[0:3,0:3] = self.robot.covariance_drive(raw_drive_meas)+ 0.035*np.eye(3)
+        Q[0:3,0:3] = self.robot.covariance_drive(raw_drive_meas)+ 0.001*np.eye(3)
         return Q
 
     def add_landmarks(self, measurements):
