@@ -100,22 +100,34 @@ class EKF:
     def update(self, measurements):
         if not measurements:
             return
-    # TODO:(Already Done) add your codes here to compute the updated x (implemented below)
+        # Outlier rejection using Mahalanobis distance
+        inlier_measurements = []
+        inlier_idx_list = []
+        for lm in measurements:
+            idx = self.taglist.index(lm.tag)
+            z = lm.position.reshape(-1,1)
+            z_hat = self.robot.measure(self.markers, [idx]).reshape(-1,1)
+            H = self.robot.derivative_measure(self.markers, [idx])
+            S = H @ self.P @ H.T + lm.covariance
+            y = z - z_hat
+            d2 = float(y.T @ np.linalg.inv(S) @ y)
+            threshold = 9.21  # 99% confidence for 2D
+            if d2 < threshold:
+                inlier_measurements.append(lm)
+                inlier_idx_list.append(idx)
+        if not inlier_measurements:
+            return  # No inliers, skip update
 
-        # Construct measurement index list
-        tags = [lm.tag for lm in measurements]
-        idx_list = [self.taglist.index(tag) for tag in tags]
-
-        # Stack measurements and set covariance
-        z = np.concatenate([lm.position.reshape(-1,1) for lm in measurements], axis=0)
-        R = np.zeros((2*len(measurements),2*len(measurements)))
-        for i in range(len(measurements)):
-            R[2*i:2*i+2,2*i:2*i+2] = measurements[i].covariance
+        # Stack inlier measurements and set covariance
+        z = np.concatenate([lm.position.reshape(-1,1) for lm in inlier_measurements], axis=0)
+        R = np.zeros((2*len(inlier_measurements),2*len(inlier_measurements)))
+        for i in range(len(inlier_measurements)):
+            R[2*i:2*i+2,2*i:2*i+2] = inlier_measurements[i].covariance
 
         # Compute expected measurements from current state
-        z_hat = self.robot.measure(self.markers, idx_list)
+        z_hat = self.robot.measure(self.markers, inlier_idx_list)
         z_hat = z_hat.reshape((-1,1),order="F")
-        H = self.robot.derivative_measure(self.markers, idx_list)
+        H = self.robot.derivative_measure(self.markers, inlier_idx_list)
 
         x = self.get_state_vector()
         # Innovation
@@ -128,12 +140,9 @@ class EKF:
         x = x + K @ y
         # Covariance update (Joseph form)
         I = np.eye(self.P.shape[0])
-        # self.P = (I - K @ H) @ self.P - original line
-        # ADDED ----------------------------------------
         IKH = I - K @ H
         self.P = IKH @ self.P @ IKH.T + K @ R @ K.T
         self.P = 0.5 * (self.P + self.P.T)  # ensure symmetry
-        # -----------------------------------------------
         # Set state back (robot + landmarks)
         self.set_state_vector(x)
         # Wrap heading
