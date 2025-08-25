@@ -22,14 +22,20 @@ class Robot:
 
         # Apply the velocities
         dt = drive_meas.dt
-        if angular_velocity == 0:
-            self.state[0] += np.cos(self.state[2]) * linear_velocity * dt
-            self.state[1] += np.sin(self.state[2]) * linear_velocity * dt
+        v, w = linear_velocity, angular_velocity
+        th = float(self.state[2])
+        if abs(w) * dt < 1e-8:  # straight-line (small-angle) limit
+            dx = v * dt * np.cos(th)
+            dy = v * dt * np.sin(th)
+            dth = w * dt
         else:
-            th = self.state[2]
-            self.state[0] += linear_velocity / angular_velocity * (np.sin(th+dt*angular_velocity) - np.sin(th))
-            self.state[1] += -linear_velocity / angular_velocity * (np.cos(th+dt*angular_velocity) - np.cos(th))
-            self.state[2] += dt*angular_velocity
+            th2 = th + w * dt
+            dx = (v / w) * (np.sin(th2) - np.sin(th))
+            dy = - (v / w) * (np.cos(th2) - np.cos(th))
+            dth = w * dt
+        self.state[0,0] += dx
+        self.state[1,0] += dy
+        self.state[2,0] = (self.state[2,0] + dth + np.pi) % (2*np.pi) - np.pi
 
     def measure(self, markers, idx_list):
         # Markers are 2d landmarks in a 2xn structure where there are n landmarks.
@@ -77,8 +83,8 @@ class Robot:
         th = self.state[2]
         
         # TODO: add your codes here to compute DFx using lin_vel, ang_vel, dt, and th
-        eps = 1e-9
-        if abs(ang_vel) < eps:  # Straight line approximation
+        eps = 1e-8
+        if abs(ang_vel) * dt < eps:  # Straight line approximation based on |w|*dt
             DFx[0,2] = -lin_vel * dt * np.sin(th)
             DFx[1,2] =  lin_vel * dt * np.cos(th)
         else:
@@ -134,8 +140,8 @@ class Robot:
         Jac2 = np.zeros((3,2))
         
         # TODO: add your codes here to compute Jac2 using lin_vel, ang_vel, dt, th, and th2
-        eps = 1e-9
-        if abs(ang_vel) < eps:  # Use series expansion limit for small angular velocity
+        eps = 1e-8
+        if abs(ang_vel) * dt < eps:  # Use series expansion limit for small angular velocity
             # Increments (for reference):
             # x_inc = lin_vel * dt * cos(th)
             # y_inc = lin_vel * dt * sin(th)
@@ -167,5 +173,11 @@ class Robot:
         # Compute covariance
         cov = np.diag((drive_meas.left_cov, drive_meas.right_cov))
         cov = Jac @ cov @ Jac.T
-        
+        # small additive process noise for robustness (distance & rotation proportional)
+        travel = abs(lin_vel) * dt
+        cov += np.diag([
+            1e-4 + 1e-3*travel,
+            1e-4 + 1e-3*travel,
+            1e-6 + 5e-5*abs(ang_vel)*dt
+        ])
         return cov
