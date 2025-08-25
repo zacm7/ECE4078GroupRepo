@@ -31,6 +31,9 @@ class aruco_detector:
         seen_ids = []
         for i in range(len(ids)):
             idi = ids[i,0]
+            # Only accept marker IDs 1-10
+            if idi < 1 or idi > 10:
+                continue
             # Some markers appear multiple times but should only be handled once.
             if idi in seen_ids:
                 continue
