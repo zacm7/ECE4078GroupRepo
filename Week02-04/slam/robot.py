@@ -84,8 +84,10 @@ class Robot:
         else:
             th2 = th + ang_vel * dt
             A = lin_vel / ang_vel
-            DFx[0,2] = A * (np.cos(th2) - np.cos(th))
-            DFx[1,2] = A * (np.sin(th2) - np.sin(th))
+            # DFx[0,2] = A * (np.cos(th2) - np.cos(th))
+            # DFx[1,2] = A * (np.sin(th2) - np.sin(th))
+            DFx[0,2] = -A * (np.sin(th2) - np.sin(th))
+            DFx[1,2] =  A * (np.cos(th2) - np.cos(th))
 
         return DFx
 
