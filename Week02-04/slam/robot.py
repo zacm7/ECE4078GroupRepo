@@ -77,6 +77,17 @@ class Robot:
         th = self.state[2]
         
         # TODO: add your codes here to compute DFx using lin_vel, ang_vel, dt, and th
+        eps = 1e-9
+        if abs(ang_vel) < eps:  # Straight line approximation
+            DFx[0,2] = -lin_vel * dt * np.sin(th)
+            DFx[1,2] =  lin_vel * dt * np.cos(th)
+        else:
+            th2 = th + ang_vel * dt
+            A = lin_vel / ang_vel
+            # DFx[0,2] = A * (np.cos(th2) - np.cos(th))
+            # DFx[1,2] = A * (np.sin(th2) - np.sin(th))
+            DFx[0,2] = -A * (np.sin(th2) - np.sin(th))
+            DFx[1,2] =  A * (np.cos(th2) - np.cos(th))
 
         return DFx
 
@@ -125,6 +136,32 @@ class Robot:
         Jac2 = np.zeros((3,2))
         
         # TODO: add your codes here to compute Jac2 using lin_vel, ang_vel, dt, th, and th2
+        eps = 1e-9
+        if abs(ang_vel) < eps:  # Use series expansion limit for small angular velocity
+            # Increments (for reference):
+            # x_inc = lin_vel * dt * cos(th)
+            # y_inc = lin_vel * dt * sin(th)
+            # th_inc = 0
+            Jac2[0,0] = dt * np.cos(th)               # ∂x/∂lin_vel
+            Jac2[1,0] = dt * np.sin(th)               # ∂y/∂lin_vel
+            Jac2[2,0] = 0.0                           # ∂θ/∂lin_vel
+            # Series expansion for derivatives wrt ang_vel around 0
+            Jac2[0,1] = -0.5 * lin_vel * dt**2 * np.sin(th)  # ∂x/∂ang_vel
+            Jac2[1,1] =  0.5 * lin_vel * dt**2 * np.cos(th)  # ∂y/∂ang_vel
+            Jac2[2,1] = dt                                  # ∂θ/∂ang_vel (θ = θ + ang_vel*dt)
+        else:
+            # General case
+            A = (np.sin(th2) - np.sin(th))
+            C = (np.cos(th2) - np.cos(th))
+            # x_inc = (lin_vel/ang_vel) * A
+            Jac2[0,0] = A / ang_vel  # ∂x/∂lin_vel
+            Jac2[0,1] = lin_vel * ( -A / (ang_vel**2) + (np.cos(th2) * dt) / ang_vel )  # ∂x/∂ang_vel
+            # y_inc = - (lin_vel/ang_vel) * C
+            Jac2[1,0] = -C / ang_vel  # ∂y/∂lin_vel
+            Jac2[1,1] = lin_vel * ( C / (ang_vel**2) + (np.sin(th2) * dt) / ang_vel )   # ∂y/∂ang_vel
+            # θ_inc = ang_vel * dt
+            Jac2[2,0] = 0.0
+            Jac2[2,1] = dt
 
         # Derivative of x,y,theta w.r.t. left_speed, right_speed
         Jac = Jac2 @ Jac1

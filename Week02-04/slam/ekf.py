@@ -21,7 +21,7 @@ class EKF:
 
         # Covariance matrix
         self.P = np.zeros((3,3))
-        self.init_lm_cov = 1e3
+        self.init_lm_cov = 1e5
         self.robot_init_state = None
         self.lm_pics = []
         for i in range(1, 11):
@@ -86,35 +86,68 @@ class EKF:
 
     # the prediction step of EKF
     def predict(self, raw_drive_meas):
-
+    # TODO: add your codes here to complete the prediction step (implemented below)
         F = self.state_transition(raw_drive_meas)
-        x = self.get_state_vector()
-
-        # TODO: add your codes here to complete the prediction step
+        # Propagate robot pose using its motion model
+        self.robot.drive(raw_drive_meas)
+        # Wrap heading to [-pi, pi]
+        self.robot.state[2,0] = (self.robot.state[2,0] + np.pi) % (2*np.pi) - np.pi
+        # Covariance propagation
+        Q = self.predict_covariance(raw_drive_meas)
+        self.P = F @ self.P @ F.T + Q
 
     # the update step of EKF
     def update(self, measurements):
         if not measurements:
             return
+        # Outlier rejection using Mahalanobis distance
+        inlier_measurements = []
+        inlier_idx_list = []
+        R_SCALE = 4.0  # scale measurement covariance to reduce overconfidence
+        for lm in measurements:
+            idx = self.taglist.index(lm.tag)
+            z = lm.position.reshape(-1,1)
+            z_hat = self.robot.measure(self.markers, [idx]).reshape(-1,1)
+            H = self.robot.derivative_measure(self.markers, [idx])
+            S = H @ self.P @ H.T + (lm.covariance * R_SCALE)
+            y = z - z_hat
+            d2 = float(y.T @ np.linalg.inv(S) @ y)
+            threshold = 9.21  # 99% confidence for 2D
+            if d2 < threshold:
+                inlier_measurements.append(lm)
+                inlier_idx_list.append(idx)
+        if not inlier_measurements:
+            return  # No inliers, skip update
 
-        # Construct measurement index list
-        tags = [lm.tag for lm in measurements]
-        idx_list = [self.taglist.index(tag) for tag in tags]
+        # Stack inlier measurements and set covariance
+        z = np.concatenate([lm.position.reshape(-1,1) for lm in inlier_measurements], axis=0)
+        R = np.zeros((2*len(inlier_measurements),2*len(inlier_measurements)))
+        for i in range(len(inlier_measurements)):
+            R[2*i:2*i+2,2*i:2*i+2] = inlier_measurements[i].covariance * R_SCALE
 
-        # Stack measurements and set covariance
-        z = np.concatenate([lm.position.reshape(-1,1) for lm in measurements], axis=0)
-        R = np.zeros((2*len(measurements),2*len(measurements)))
-        for i in range(len(measurements)):
-            R[2*i:2*i+2,2*i:2*i+2] = measurements[i].covariance
-
-        # Compute own measurements
-        z_hat = self.robot.measure(self.markers, idx_list)
+        # Compute expected measurements from current state
+        z_hat = self.robot.measure(self.markers, inlier_idx_list)
         z_hat = z_hat.reshape((-1,1),order="F")
-        H = self.robot.derivative_measure(self.markers, idx_list)
+        H = self.robot.derivative_measure(self.markers, inlier_idx_list)
 
         x = self.get_state_vector()
-
-        # TODO: add your codes here to compute the updated x
+        # Innovation
+        y = z - z_hat
+        # Innovation covariance
+        S = H @ self.P @ H.T + R
+        # Kalman gain
+        K = self.P @ H.T @ np.linalg.inv(S)
+        # State update
+        x = x + K @ y
+        # Covariance update (Joseph form)
+        I = np.eye(self.P.shape[0])
+        IKH = I - K @ H
+        self.P = IKH @ self.P @ IKH.T + K @ R @ K.T
+        self.P = 0.5 * (self.P + self.P.T)  # ensure symmetry
+        # Set state back (robot + landmarks)
+        self.set_state_vector(x)
+        # Wrap heading
+        self.robot.state[2,0] = (self.robot.state[2,0] + np.pi) % (2*np.pi) - np.pi
 
 
     def state_transition(self, raw_drive_meas):
@@ -126,34 +159,64 @@ class EKF:
     def predict_covariance(self, raw_drive_meas):
         n = self.number_landmarks()*2 + 3
         Q = np.zeros((n,n))
-        Q[0:3,0:3] = self.robot.covariance_drive(raw_drive_meas)+ 0.01*np.eye(3)
+        Q[0:3,0:3] = self.robot.covariance_drive(raw_drive_meas)+ 0.007*np.eye(3)
         return Q
 
     def add_landmarks(self, measurements):
         if not measurements:
             return
 
-        th = self.robot.state[2]
-        robot_xy = self.robot.state[0:2,:]
-        R_theta = np.block([[np.cos(th), -np.sin(th)],[np.sin(th), np.cos(th)]])
+        th = float(self.robot.state[2])
+        c, s = np.cos(th), np.sin(th) #renamed
+        R_theta = np.array([[c, -s],
+                            [s,  c]])
+        robot_xy = self.robot.state[0:2, :]
 
-        # Add new landmarks to the state
         for lm in measurements:
             if lm.tag in self.taglist:
-                # ignore known tags
                 continue
-            
-            lm_bff = lm.position
-            lm_inertial = robot_xy + R_theta @ lm_bff
+
+            # Landmark position in robot frame → inertial frame
+            z = lm.position.reshape(2, 1) #renamed
+            lm_inertial = robot_xy + R_theta @ z
 
             self.taglist.append(int(lm.tag))
             self.markers = np.concatenate((self.markers, lm_inertial), axis=1)
 
-            # Create a simple, large covariance to be fixed by the update step
-            self.P = np.concatenate((self.P, np.zeros((2, self.P.shape[1]))), axis=0)
-            self.P = np.concatenate((self.P, np.zeros((self.P.shape[0], 2))), axis=1)
-            self.P[-2,-2] = self.init_lm_cov**2
-            self.P[-1,-1] = self.init_lm_cov**2
+
+            # ADDED --------------------------
+            zx, zy = float(z[0]), float(z[1])
+            # d(landmark)/d(robot_state)
+            Jx = np.array([[1, 0, -s*zx - c*zy],
+                        [0, 1,  c*zx - s*zy]])
+            # d(landmark)/d(measurement)
+            Jz = R_theta
+
+            # --- Existing covariance sub‑blocks ---
+            P_rr = self.P[0:3, 0:3]   # robot‑robot
+            P_rO = self.P[0:3, 3:]    # robot‑otherLMs
+            P_Or = P_rO.T
+
+            # --- New covariance terms ---
+            P_ll = Jx @ P_rr @ Jx.T + Jz @ lm.covariance @ Jz.T   # landmark‑landmark
+            P_rl = P_rr @ Jx.T                                   # robot‑landmark
+            P_Ol = P_Or @ Jx.T                                   # otherLMs‑landmark
+
+            # --- Augment P ---
+            n = self.P.shape[0]
+            top    = np.concatenate((self.P, np.zeros((n, 2))), axis=1)
+            newcol = np.vstack((P_rl, P_Ol))
+            bottom = np.concatenate((newcol.T, P_ll), axis=1)
+            self.P = np.vstack((top, bottom))
+            self.P = 0.5 * (self.P + self.P.T)  # enforce symmetry
+
+            # -----------------------------------------------
+
+            # # Create a simple, large covariance to be fixed by the update step
+            # self.P = np.concatenate((self.P, np.zeros((2, self.P.shape[1]))), axis=0)
+            # self.P = np.concatenate((self.P, np.zeros((self.P.shape[0], 2))), axis=1)
+            # self.P[-2,-2] = self.init_lm_cov**2
+            # self.P[-1,-1] = self.init_lm_cov**2
 
     ##########################################
     ##########################################
