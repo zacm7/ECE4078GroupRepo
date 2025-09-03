@@ -45,11 +45,11 @@ class Detector:
             y2 = int(xyxy[3])
 
             # draw bounding box
-            img_out = cv2.rectangle(img_out, (x1, y1), (x2, y2), self.class_colour[bbox[0]], thickness=2)
+            img_out = cv2.rectangle(img_out, (x1, y1), (x2, y2), self.class_colour[bbox[0].lower()], thickness=2)
 
             # draw class label
             img_out = cv2.putText(img_out, bbox[0], (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                  self.class_colour[bbox[0]], 2)
+                                  self.class_colour[bbox[0].lower()], 2)
 
         return bboxes, img_out
 
@@ -88,9 +88,9 @@ if __name__ == '__main__':
     # get current script directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    yolo = Detector(f'{script_dir}/model/yolov8_model.pt')
+    yolo = Detector(f'{script_dir}/model/best.pt')
 
-    img = cv2.imread(f'{script_dir}/test/test_image_1.png')
+    img = cv2.imread(f'{script_dir}/test/img_157.png')
 
     bboxes, img_out = yolo.detect_single_image(img)
 
