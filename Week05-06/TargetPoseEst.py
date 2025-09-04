@@ -4,7 +4,7 @@ import os
 import ast
 import cv2
 from YOLO.detector import Detector
-
+j
 # list of target fruits and vegs types
 TARGET_TYPES = ['orange', 'lemon', 'lime', 'tomato', 'capsicum', 'potato', 'pumpkin', 'garlic']
 

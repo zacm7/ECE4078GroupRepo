@@ -13,7 +13,7 @@ class Detector:
         self.class_colour = {
             'orange': (0, 165, 255),
             'lemon': (0, 255, 255),
-            'lime': (0, 255, 0),
+            'pear': (0, 255, 0),
             'tomato': (0, 0, 255),
             'capsicum': (255, 0, 0),
             'potato': (255, 255, 0),
@@ -88,9 +88,9 @@ if __name__ == '__main__':
     # get current script directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    yolo = Detector(f'{script_dir}/model/best.pt')
+    yolo = Detector(f'{script_dir}/model/bestv2.pt')
 
-    img = cv2.imread(f'{script_dir}/test/img_17.png')
+    img = cv2.imread(f'{script_dir}/test/img_54.png')
 
     bboxes, img_out = yolo.detect_single_image(img)
 
