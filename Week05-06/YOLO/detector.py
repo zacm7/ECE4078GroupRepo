@@ -90,12 +90,11 @@ if __name__ == '__main__':
 
     yolo = Detector(f'{script_dir}/model/best.pt')
 
-    img = cv2.imread(f'{script_dir}/test/img_157.png')
+    img = cv2.imread(f'{script_dir}/test/img_17.png')
 
     bboxes, img_out = yolo.detect_single_image(img)
 
     print(bboxes)
     print(len(bboxes))
-
     cv2.imshow('yolo detect', img_out)
     cv2.waitKey(0)
