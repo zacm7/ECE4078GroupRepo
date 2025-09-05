@@ -4,9 +4,9 @@ import os
 import ast
 import cv2
 from YOLO.detector import Detector
-j
+
 # list of target fruits and vegs types
-TARGET_TYPES = ['orange', 'lemon', 'lime', 'tomato', 'capsicum', 'potato', 'pumpkin', 'garlic']
+TARGET_TYPES = ['orange', 'lemon', 'pear', 'tomato', 'capsicum', 'potato', 'pumpkin', 'garlic']
 
 
 def estimate_pose(camera_matrix, obj_info, robot_pose):
@@ -19,7 +19,7 @@ def estimate_pose(camera_matrix, obj_info, robot_pose):
     target_dimensions_dict = {
         'orange': [0.084, 0.085, 0.077],
         'lemon': [0.074, 0.047, 0.05],
-        'lime': [0.065, 0.06, 0.05],
+        'pear': [0.093, 0.06, 0.08],
         'tomato': [0.074, 0.074, 0.064],
         'capsicum': [0.079, 0.08, 0.09],
         'potato': [0.093, 0.073, 0.054],
@@ -54,8 +54,8 @@ def estimate_pose(camera_matrix, obj_info, robot_pose):
     delta_x_world = x_relative * np.cos(robot_theta) - y_relative * np.sin(robot_theta)
     delta_y_world = x_relative * np.sin(robot_theta) + y_relative * np.cos(robot_theta)
 
-    target_pose = {'x': robot_x + delta_x_world,
-                   'y': robot_y + delta_y_world}
+    target_pose = {'x': float(robot_x + delta_x_world),
+                   'y': float(robot_y + delta_y_world)}
 
     return target_pose
 
@@ -102,7 +102,7 @@ if __name__ == "__main__":
     camera_matrix = np.loadtxt(fileK, delimiter=',')
 
     # Init YOLO model
-    model_path = f'{script_dir}/YOLO/model/best.pt'
+    model_path = f'{script_dir}/YOLO/model/bestv2.pt'
     yolo = Detector(model_path)
 
     # Load robot poses

@@ -7,8 +7,9 @@ from ultralytics.utils import ops
 
 
 class Detector:
-    def __init__(self, model_path):
+    def __init__(self, model_path, conf_thresh=0.55):
         self.model = YOLO(model_path)
+        self.conf_thresh = conf_thresh  # confidence threshold
 
         self.class_colour = {
             'orange': (0, 165, 255),
@@ -23,13 +24,7 @@ class Detector:
 
     def detect_single_image(self, img):
         """
-        function:
-            detect target(s) in an image
-        input:
-            img: image, e.g., image read by the cv2.imread() function
-        output:
-            bboxes: list of lists, box info [label,[x,y,width,height]] for all detected targets in image
-            img_out: image with bounding boxes and class labels drawn on
+        Detect target(s) in an image and return bounding boxes + annotated image
         """
         bboxes = self._get_bounding_boxes(img)
 
@@ -37,48 +32,56 @@ class Detector:
 
         # draw bounding boxes on the image
         for bbox in bboxes:
-            #  translate bounding box info back to the format of [x1,y1,x2,y2]
-            xyxy = ops.xywh2xyxy(bbox[1])
-            x1 = int(xyxy[0])
-            y1 = int(xyxy[1])
-            x2 = int(xyxy[2])
-            y2 = int(xyxy[3])
+            # unpack
+            label = bbox[0]
+            box_xywh = bbox[1]
+            conf = bbox[2]
+
+            # convert [x,y,w,h] to [x1,y1,x2,y2]
+            xyxy = ops.xywh2xyxy(box_xywh)
+            x1, y1, x2, y2 = map(int, xyxy)
 
             # draw bounding box
-            img_out = cv2.rectangle(img_out, (x1, y1), (x2, y2), self.class_colour[bbox[0].lower()], thickness=2)
+            img_out = cv2.rectangle(
+                img_out, (x1, y1), (x2, y2),
+                self.class_colour[label.lower()],
+                thickness=2
+            )
 
-            # draw class label
-            img_out = cv2.putText(img_out, bbox[0], (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                                  self.class_colour[bbox[0].lower()], 2)
+            # draw class label + confidence
+            text = f"{label} {conf:.2f}"
+            img_out = cv2.putText(
+                img_out, text, (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                self.class_colour[label.lower()], 2
+            )
 
         return bboxes, img_out
 
     def _get_bounding_boxes(self, cv_img):
         """
-        function:
-            get bounding box and class label of target(s) in an image as detected by YOLOv8
-        input:
-            cv_img    : image, e.g., image read by the cv2.imread() function
-            model_path: str, e.g., 'yolov8n.pt', trained YOLOv8 model
-        output:
-            bounding_boxes: list of lists, box info [label,[x,y,width,height]] for all detected targets in image
+        Run YOLO prediction and return bounding boxes
+        Format: [label, [x,y,w,h], confidence]
         """
-
-        # predict target type and bounding box with your trained YOLO
-
         predictions = self.model.predict(cv_img, imgsz=320, verbose=False)
 
-        # get bounding box and class label for target(s) detected
         bounding_boxes = []
         for prediction in predictions:
             boxes = prediction.boxes
             for box in boxes:
-                # bounding format in [x, y, width, height]
+                conf = float(box.conf[0])
+                if conf < self.conf_thresh:  # skip low confidence detections
+                    continue
+
+                # bounding format [x, y, w, h]
                 box_cord = box.xywh[0]
+                box_label = box.cls  # class id
 
-                box_label = box.cls  # class label of the box
-
-                bounding_boxes.append([prediction.names[int(box_label)], np.asarray(box_cord)])
+                bounding_boxes.append([
+                    prediction.names[int(box_label)],  # class name
+                    np.asarray(box_cord),
+                    conf
+                ])
 
         return bounding_boxes
 
@@ -88,13 +91,15 @@ if __name__ == '__main__':
     # get current script directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
-    yolo = Detector(f'{script_dir}/model/bestv2.pt')
+    yolo = Detector(f'{script_dir}/model/bestv2.pt', conf_thresh=0.55)
 
-    img = cv2.imread(f'{script_dir}/test/img_54.png')
+    img = cv2.imread(f'{script_dir}/test/img_81.png')
 
     bboxes, img_out = yolo.detect_single_image(img)
 
-    print(bboxes)
-    print(len(bboxes))
+    print("Detections:", bboxes)
+    print("Number of detections:", len(bboxes))
+
     cv2.imshow('yolo detect', img_out)
     cv2.waitKey(0)
+    cv2.destroyAllWindows()

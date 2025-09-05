@@ -8,7 +8,7 @@ import numpy as np
 
 # import utility functions
 sys.path.insert(0, "{}/util".format(os.getcwd()))
-from util.pibot import PenguinPi    # access the robot
+from util.pibot import PenguinPi    # access the robotf
 import util.DatasetHandler as dh    # save/load functions
 import util.measure as measure      # measurements
 import pygame                       # python package for GUI
@@ -314,7 +314,7 @@ if __name__ == "__main__":
     parser.add_argument("--calib_dir", type=str, default="calibration/param/")
     parser.add_argument("--save_data", action='store_true')
     parser.add_argument("--play_data", action='store_true')
-    parser.add_argument("--yolo_model", default='YOLO/model/best.pt')
+    parser.add_argument("--yolo_model", default='YOLO/model/bestv2.pt')
     args, _ = parser.parse_known_args()
 
     pygame.font.init()
