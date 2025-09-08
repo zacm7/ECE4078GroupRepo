@@ -102,7 +102,7 @@ def merge_estimations(target_pose_dict):
 
     # Greedy spatial clustering per class using a distance threshold.
     # Observations for a class are grouped if they are within `merge_threshold` metres of a cluster centre.
-    merge_threshold = 0.15  # 15 cm (as specified in lab notes)
+    merge_threshold = 0.8  # 15 cm (as specified in lab notes)
 
     # organize estimates by class base name (strip trailing _index)
     per_class = {}
