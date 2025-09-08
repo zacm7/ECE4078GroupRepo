@@ -17,14 +17,14 @@ def estimate_pose(camera_matrix, obj_info, robot_pose):
 
     # True object dimensions [w, d, h]
     target_dimensions_dict = {
-        'orange': [0.084, 0.085, 0.077],
-        'lemon': [0.074, 0.047, 0.05],
-        'pear': [0.093, 0.06, 0.08],
-        'tomato': [0.074, 0.074, 0.064],
-        'capsicum': [0.079, 0.08, 0.09],
-        'potato': [0.093, 0.073, 0.054],
-        'pumpkin': [0.085, 0.082, 0.075],
-        'garlic': [0.063, 0.06, 0.075]
+        'orange': [0.063, 0.065, 0.069],
+        'lemon': [0.067, 0.044, 0.047],
+        'pear': [0.063, 0.055, 0.098],
+        'tomato': [0.059, 0.0625, 0.060],
+        'capsicum': [0.066, 0.058, 0.088],
+        'potato': [0.082, 0.060, 0.062],
+        'pumpkin': [0.066, 0.058, 0.068],
+        'garlic': [0.060, 0.054, 0.075]
     }
 
     # Parse detection info

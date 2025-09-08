@@ -93,7 +93,7 @@ if __name__ == '__main__':
 
     yolo = Detector(f'{script_dir}/model/bestv2.pt', conf_thresh=0.55)
 
-    img = cv2.imread(f'{script_dir}/test/img_81.png')
+    img = cv2.imread(f'{script_dir}/test/820.png')
 
     bboxes, img_out = yolo.detect_single_image(img)
 
