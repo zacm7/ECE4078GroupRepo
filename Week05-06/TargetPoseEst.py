@@ -36,15 +36,26 @@ def estimate_pose(camera_matrix, obj_info, robot_pose):
     cx = float(camera_matrix[0][2])
     # there are 8 possible types of fruits and vegs
     # Measurements provided by the user (width, depth, height) in metres
+    # target_dimensions_dict = {
+    #     'orange': [0.063, 0.065, 0.069],
+    #     'lemon': [0.067, 0.044, 0.047],
+    #     'pear': [0.063, 0.055, 0.1],
+    #     'tomato': [0.059, 0.0625, 0.060],
+    #     'capsicum': [0.075, 0.075, 0.09],
+    #     'potato': [0.082, 0.060, 0.062],
+    #     'pumpkin': [0.066, 0.058, 0.068],
+    #     'garlic': [0.060, 0.054, 0.075]
+    # }
+
     target_dimensions_dict = {
-        'orange': [0.063, 0.065, 0.069],
-        'lemon': [0.067, 0.044, 0.047],
-        'pear': [0.063, 0.055, 0.098],
-        'tomato': [0.059, 0.0625, 0.060],
-        'capsicum': [0.066, 0.058, 0.088],
-        'potato': [0.082, 0.060, 0.062],
-        'pumpkin': [0.066, 0.058, 0.068],
-        'garlic': [0.060, 0.054, 0.075]
+        'orange': [0.0762, 0.073, 0.0700],
+        'lemon': [0.0727, 0.047, 0.0498],
+        'pear': [0.0780, 0.0721, 0.1080],
+        'tomato': [0.0680, 0.0691, 0.0593],
+        'capsicum':[0.0799, 0.0811, 0.0856],
+        'potato': [0.0920, 0.0672, 0.0572],
+        'pumpkin': [0.0780, 0.0814, 0.0726],
+        'garlic': [0.0550, 0.0621, 0.0700],
     }
 
     # parse detection info
@@ -167,16 +178,22 @@ if __name__ == "__main__":
     for image_path in image_poses.keys():
         input_image = cv2.imread(image_path)
         bounding_boxes, bbox_img = yolo.detect_single_image(input_image)
-        # cv2.imshow('bbox', bbox_img)
-        # cv2.waitKey(0)
+        cv2.imshow('bbox', bbox_img)
+        cv2.waitKey(0)
         robot_pose = image_poses[image_path]
 
         for detection in bounding_boxes:
             # count the occurrence of each target type
             occurrence = detected_type_list.count(detection[0])
-            target_pose_dict[f'{detection[0]}_{occurrence}'] = estimate_pose(camera_matrix, detection, robot_pose)
-
-            detected_type_list.append(detection[0])
+            est_pose = estimate_pose(camera_matrix, detection, robot_pose)
+            if est_pose is not None:
+                # Only count if within 0.3m of robot
+                rob_x = float(robot_pose[0][0]) if hasattr(robot_pose[0], '__len__') else float(robot_pose[0])
+                rob_y = float(robot_pose[1][0]) if hasattr(robot_pose[1], '__len__') else float(robot_pose[1])
+                dist = np.hypot(est_pose['x'] - rob_x, est_pose['y'] - rob_y)
+                if dist <= 0.3:
+                    target_pose_dict[f'{detection[0]}_{occurrence}'] = est_pose
+                    detected_type_list.append(detection[0])
 
     # merge the estimations of the targets so that there are at most 3 estimations of each target type
     target_est = {}

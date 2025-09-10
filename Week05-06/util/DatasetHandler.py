@@ -10,28 +10,48 @@ import json
 # save a keyboard control sequence and a list of images seen by the robot
 class DatasetWriter:
     def __init__(self, dataset_name):
-        self.folder = dataset_name+'/'
-        
-        if not os.path.exists(self.folder):
-            os.makedirs(self.folder)
-        else:
-            os.rmdir(self.folder)
-            os.makedirs(self.folder)
+        self.folder = dataset_name + '/'
 
-        kb_fname = self.folder + "keyboard.csv"    
+        # ensure folder is empty: remove if exists, else create
+        import shutil
+        if os.path.exists(self.folder):
+            try:
+                shutil.rmtree(self.folder)
+            except Exception:
+                # fallback: try to remove only if empty
+                try:
+                    os.rmdir(self.folder)
+                except Exception:
+                    pass
+        os.makedirs(self.folder, exist_ok=True)
+
+        # initialize file handles to None so __del__ is safe even on early failure
+        self.kb_f = None
+        self.img_f = None
+
+        kb_fname = self.folder + "keyboard.csv"
         self.kb_f = open(kb_fname, 'w')
         self.kb_fc = csv.writer(self.kb_f)
-        
+
         img_fname = self.folder + "images.csv"
         self.img_f = open(img_fname, 'w')
         self.img_fc = csv.writer(self.img_f)
-        
+
         self.t0 = time.time()
         self.image_count = 0
-    
+
     def __del__(self):
-        self.kb_f.close()
-        self.img_f.close()
+        # close files if they were opened
+        try:
+            if getattr(self, 'kb_f', None):
+                self.kb_f.close()
+        except Exception:
+            pass
+        try:
+            if getattr(self, 'img_f', None):
+                self.img_f.close()
+        except Exception:
+            pass
     
     def write_keyboard(self, left_vel, right_vel):
         ts = time.time() - self.t0
@@ -148,4 +168,4 @@ if __name__ == '__main__':
 
 
 
-    
+

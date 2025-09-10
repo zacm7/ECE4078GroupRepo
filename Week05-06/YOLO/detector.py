@@ -72,34 +72,63 @@ class Detector:
                 conf = float(box.conf[0])
                 if conf < self.conf_thresh:  # skip low confidence detections
                     continue
-
-                # bounding format [x, y, w, h]
                 box_cord = box.xywh[0]
                 box_label = box.cls  # class id
-
                 bounding_boxes.append([
                     prediction.names[int(box_label)],  # class name
                     np.asarray(box_cord),
                     conf
                 ])
 
+        # --- Post-processing NMS per class ---
+        def nms_per_class(boxes, iou_thresh=0.5):
+            # boxes: [label, [x,y,w,h], conf]
+            final_boxes = []
+            by_class = {}
+            for b in boxes:
+                by_class.setdefault(b[0], []).append(b)
+            for cls, items in by_class.items():
+                # Convert to xyxy for NMS
+                xyxy = np.array([ops.xywh2xyxy(b[1]) for b in items])
+                confs = np.array([b[2] for b in items])
+                idxs = cv2.dnn.NMSBoxes(xyxy.tolist(), confs.tolist(), self.conf_thresh, iou_thresh)
+                if len(idxs) > 0:
+                    for i in idxs.flatten():
+                        final_boxes.append(items[i])
+            return final_boxes
+
+        bounding_boxes = nms_per_class(bounding_boxes, iou_thresh=0.5)
         return bounding_boxes
 
 
 # FOR TESTING ONLY
 if __name__ == '__main__':
-    # get current script directory
+    import sys
+    import glob
+    # Usage: python detector.py <image_folder>
+    if len(sys.argv) < 2:
+        print("Usage: python detector.py <image_folder>")
+        sys.exit(1)
+    folder_path = sys.argv[1]
     script_dir = os.path.dirname(os.path.abspath(__file__))
-
-    yolo = Detector(f'{script_dir}/model/bestv2.pt', conf_thresh=0.55)
-
-    img = cv2.imread(f'{script_dir}/test/820.png')
-
-    bboxes, img_out = yolo.detect_single_image(img)
-
-    print("Detections:", bboxes)
-    print("Number of detections:", len(bboxes))
-
-    cv2.imshow('yolo detect', img_out)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    yolo = Detector(f'{script_dir}/model/bestv3_new.pt', conf_thresh=0.55)
+    # Supported image extensions
+    img_exts = ('*.png', '*.jpg', '*.jpeg', '*.bmp')
+    img_files = []
+    for ext in img_exts:
+        img_files.extend(glob.glob(os.path.join(folder_path, ext)))
+    if not img_files:
+        print(f"No images found in {folder_path}")
+        sys.exit(1)
+    for img_path in img_files:
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"Error: Could not read image {img_path}")
+            continue
+        bboxes, img_out = yolo.detect_single_image(img)
+        print(f"Image: {img_path}")
+        print("Detections:", bboxes)
+        print("Number of detections:", len(bboxes))
+        cv2.imshow('yolo detect', img_out)
+        #cv2.waitKey(1000)  # Show each image for 0.5s
+        cv2.waitKey(0)

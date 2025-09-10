@@ -103,7 +103,7 @@ class EKF:
         # Outlier rejection using Mahalanobis distance
         inlier_measurements = []
         inlier_idx_list = []
-        R_SCALE = 4.0  # scale measurement covariance to reduce overconfidence
+        R_SCALE = 3.0  # scale measurement covariance to reduce overconfidence
         for lm in measurements:
             idx = self.taglist.index(lm.tag)
             z = lm.position.reshape(-1,1)
@@ -159,7 +159,7 @@ class EKF:
     def predict_covariance(self, raw_drive_meas):
         n = self.number_landmarks()*2 + 3
         Q = np.zeros((n,n))
-        Q[0:3,0:3] = self.robot.covariance_drive(raw_drive_meas)+ 0.007*np.eye(3)
+        Q[0:3,0:3] = self.robot.covariance_drive(raw_drive_meas)+ 0.005*np.eye(3)
         return Q
 
     def add_landmarks(self, measurements):

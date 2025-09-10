@@ -242,16 +242,16 @@ class Operate:
         for event in pygame.event.get():
             # drive forward
             if event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
-                self.command['motion'][0] = min(self.command['motion'][0] + 1, 1)
+                self.command['motion'] = [1, 0]  # drive forward: linear=10, angular=0
             # drive backward
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
-                self.command['motion'][0] = max(self.command['motion'][0] - 1, -1)
+                self.command['motion'] = [-1, 0]  # drive backward: linear=-10, angular=0
             # turn left
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_LEFT:
-                self.command['motion'][1] = min(self.command['motion'][1] + 1, 1)
+                self.command['motion'] = [0, 1]  # turn left: linear=0, angular=-10
             # drive right
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_RIGHT:
-                self.command['motion'][1] = max(self.command['motion'][1] - 1, -1)
+                self.command['motion'] = [0, -1]   # turn right: linear=0, angular=10
             # stop
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE:
                 self.command['motion'] = [0, 0]
