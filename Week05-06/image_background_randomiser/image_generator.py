@@ -34,91 +34,92 @@ def randomise_image():
     # get the background images path
     background_images_path = glob.glob('background_images/*')
 
-    total = len(background_images_path) * len(fruit_images_path) * VARIATION_PER_BACKGROUND
+    total = 50  # Only generate 50 images
 
     count = 0
-    for background in background_images_path:
-        for fruit_path in fruit_images_path:
+    while count < total:
+        # Randomly select a background
+        background = np.random.choice(background_images_path)
+        background_image = cv2.imread(background)
+
+        # resize the background image to 320 x 240 pixels if it is not
+        if background_image.shape[0] != 240 or background_image.shape[1] != 320:
+            background_image = cv2.resize(background_image, (320, 240))
+
+        output_image = background_image.copy()
+
+        # Randomly select 2 different fruits
+        fruit_paths = np.random.choice(fruit_images_path, size=2, replace=False)
+        for fruit_path in fruit_paths:
             # read the fruit image
             fruit_image = cv2.imread(fruit_path)
-            # read the background image
-            background_image = cv2.imread(background)
-
-            # resize the background image to 320 x 240 pixels if it is not
-            if background_image.shape[0] != 240 or background_image.shape[1] != 320:
-                background_image = cv2.resize(background_image, (320, 240))
 
             fruit = get_fruit_roi(fruit_image)
 
-            for n in range(VARIATION_PER_BACKGROUND):
-                # resize the fruit image
-                fruit_w = fruit.shape[1]
-                fruit_h = fruit.shape[0]
+            fruit_w = fruit.shape[1]
+            fruit_h = fruit.shape[0]
 
-                scale = np.random.uniform(MIN_RESIZE_FACTOR, MAX_RESIZE_FACTOR)
+            scale = np.random.uniform(MIN_RESIZE_FACTOR, MAX_RESIZE_FACTOR)
 
-                # resize the fruit image
-                fruit_fresh = cv2.resize(fruit, (int(fruit_w * scale), int(fruit_h * scale)))
+            # resize the fruit image
+            fruit_fresh = cv2.resize(fruit, (int(fruit_w * scale), int(fruit_h * scale)))
 
-                # get the fruit image width and height
+            fruit_w = fruit_fresh.shape[1]
+            fruit_h = fruit_fresh.shape[0]
+
+            background_w = output_image.shape[1]
+            background_h = output_image.shape[0]
+
+            # get the random x and y position of the fruit
+            x = int(np.random.uniform(-fruit_w/2, background_w - fruit_w / 2))
+            y = int(np.random.uniform(-fruit_h/2, background_h - fruit_h / 2))
+
+            # crop the fruit image if it is out of the background
+            if x < 0:
+                fruit_fresh = fruit_fresh[:, -x:]
                 fruit_w = fruit_fresh.shape[1]
+                x = 0
+
+            if y < 0:
+                fruit_fresh = fruit_fresh[-y:, :]
+                fruit_h = fruit_fresh.shape[0]
+                y = 0
+
+            if x + fruit_w > background_w:
+                fruit_fresh = fruit_fresh[:, :background_w - x]
+                fruit_w = fruit_fresh.shape[1]
+
+            if y + fruit_h > background_h:
+                fruit_fresh = fruit_fresh[:background_h - y, :]
                 fruit_h = fruit_fresh.shape[0]
 
-                # get the background image width and height
-                background_w = background_image.shape[1]
-                background_h = background_image.shape[0]
+            # get the ROI of the background
+            roi = output_image[y:y + fruit_h, x:x + fruit_w]
 
-                # get the random x and y position of the fruit
-                x = int(np.random.uniform(-fruit_w/2, background_w - fruit_w / 2))
-                y = int(np.random.uniform(-fruit_h/2, background_h - fruit_h / 2))
+            # get the mask of the fruit
+            fruit_gray = cv2.cvtColor(fruit_fresh, cv2.COLOR_BGR2GRAY)
+            ret, mask = cv2.threshold(fruit_gray, 10, 255, cv2.THRESH_BINARY)
 
-                # crop the fruit image if it is out of the background
-                if x < 0:
-                    fruit_fresh = fruit_fresh[:, -x:]
-                    fruit_w = fruit_fresh.shape[1]
-                    x = 0
+            # invert the mask
+            mask_inv = cv2.bitwise_not(mask)
 
-                if y < 0:
-                    fruit_fresh = fruit_fresh[-y:, :]
-                    fruit_h = fruit_fresh.shape[0]
-                    y = 0
+            # get the background of the fruit
+            background_of_fruit = cv2.bitwise_and(roi, roi, mask=mask_inv)
 
-                if x + fruit_w > background_w:
-                    fruit_fresh = fruit_fresh[:, :background_w - x]
-                    fruit_w = fruit_fresh.shape[1]
+            # get the fruit
+            fruit_of_fruit = cv2.bitwise_and(fruit_fresh, fruit_fresh, mask=mask)
 
-                if y + fruit_h > background_h:
-                    fruit_fresh = fruit_fresh[:background_h - y, :]
-                    fruit_h = fruit_fresh.shape[0]
+            # add the fruit to the background
+            dst = cv2.add(background_of_fruit, fruit_of_fruit)
 
-                # get the ROI of the background
-                roi = background_image[y:y + fruit_h, x:x + fruit_w]
+            # add the fruit to the background image
+            output_image[y:y + fruit_h, x:x + fruit_w] = dst
 
-                # get the mask of the fruit
-                fruit_gray = cv2.cvtColor(fruit_fresh, cv2.COLOR_BGR2GRAY)
-                ret, mask = cv2.threshold(fruit_gray, 10, 255, cv2.THRESH_BINARY)
+        # save the image
+        cv2.imwrite(f'generated_images/fruit_output_{count}.png', output_image)
 
-                # invert the mask
-                mask_inv = cv2.bitwise_not(mask)
-
-                # get the background of the fruit
-                background_of_fruit = cv2.bitwise_and(roi, roi, mask=mask_inv)
-
-                # get the fruit
-                fruit_of_fruit = cv2.bitwise_and(fruit_fresh, fruit_fresh, mask=mask)
-
-                # add the fruit to the background
-                dst = cv2.add(background_of_fruit, fruit_of_fruit)
-
-                # add the fruit to the background image
-                output_image = background_image.copy()
-                output_image[y:y + fruit_h, x:x + fruit_w] = dst
-
-                # save the image
-                cv2.imwrite(f'generated_images/fruit_output_{count}.png', output_image)
-
-                count += 1
-                print('Progress: ' + str(count) + '/' + str(total) + ' (' + str(round(count / total * 100, 2)) + '%)')
+        count += 1
+        print('Progress: ' + str(count) + '/' + str(total) + ' (' + str(round(count / total * 100, 2)) + '%)')
 
 
 def get_fruit_roi(image):

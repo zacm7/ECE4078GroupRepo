@@ -108,7 +108,7 @@ if __name__ == '__main__':
         sys.exit(1)
     folder_path = sys.argv[1]
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    yolo = Detector(f'{script_dir}/model/bestv3_new.pt', conf_thresh=0.55)
+    yolo = Detector(f'{script_dir}/model/bestv5.pt', conf_thresh=0.50)
     # Supported image extensions
     img_exts = ('*.png', '*.jpg', '*.jpeg', '*.bmp')
     img_files = []
