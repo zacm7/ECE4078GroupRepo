@@ -80,24 +80,21 @@ class Detector:
                     conf
                 ])
 
-        # --- Post-processing NMS per class ---
-        def nms_per_class(boxes, iou_thresh=0.5):
+        # --- Post-processing NMS across all classes ---
+        def nms_across_classes(boxes, iou_thresh=0.5):
             # boxes: [label, [x,y,w,h], conf]
+            if not boxes:
+                return []
+            xyxy = np.array([ops.xywh2xyxy(b[1]) for b in boxes])
+            confs = np.array([b[2] for b in boxes])
+            idxs = cv2.dnn.NMSBoxes(xyxy.tolist(), confs.tolist(), self.conf_thresh, iou_thresh)
             final_boxes = []
-            by_class = {}
-            for b in boxes:
-                by_class.setdefault(b[0], []).append(b)
-            for cls, items in by_class.items():
-                # Convert to xyxy for NMS
-                xyxy = np.array([ops.xywh2xyxy(b[1]) for b in items])
-                confs = np.array([b[2] for b in items])
-                idxs = cv2.dnn.NMSBoxes(xyxy.tolist(), confs.tolist(), self.conf_thresh, iou_thresh)
-                if len(idxs) > 0:
-                    for i in idxs.flatten():
-                        final_boxes.append(items[i])
+            if len(idxs) > 0:
+                for i in idxs.flatten():
+                    final_boxes.append(boxes[i])
             return final_boxes
 
-        bounding_boxes = nms_per_class(bounding_boxes, iou_thresh=0.5)
+        bounding_boxes = nms_across_classes(bounding_boxes, iou_thresh=0.5)
         return bounding_boxes
 
 
