@@ -9,7 +9,7 @@ from YOLO.detector import Detector
 
 # list of target fruits and vegs types
 # Make sure the names are the same as the ones used in your YOLO model
-TARGET_TYPES = ['orange', 'lemon', 'lime', 'tomato', 'capsicum', 'potato', 'pumpkin', 'garlic']
+TARGET_TYPES = ['orange', 'lemon', 'pear', 'tomato', 'capsicum', 'potato', 'pumpkin', 'garlic']
 
 
 def estimate_pose(camera_matrix, obj_info, robot_pose):
@@ -29,48 +29,73 @@ def estimate_pose(camera_matrix, obj_info, robot_pose):
     output:
         target_pose: dict, prediction of target pose
     """
-    # read in camera matrix (from camera calibration results)
-    focal_length = camera_matrix[0][0]
-
+    # read intrinsics
+    # camera_matrix expected as 3x3: [[fx, s, cx],[0, fy, cy],[0,0,1]]
+    fx = float(camera_matrix[0][0])
+    fy = float(camera_matrix[1][1])
+    cx = float(camera_matrix[0][2])
     # there are 8 possible types of fruits and vegs
-    ######### Replace with your codes #########
-    # TODO: measure actual sizes of targets [width, depth, height] and update the dictionary of true target dimensions
-    target_dimensions_dict = {'orange': [1.0,1.0,1.0], 'lemon': [1.0,1.0,1.0], 
-                              'lime': [1.0,1.0,1.0], 'tomato': [1.0,1.0,1.0], 
-                              'capsicum': [1.0,1.0,1.0], 'potato': [1.0,1.0,1.0], 
-                              'pumpkin': [1.0,1.0,1.0], 'garlic': [1.0,1.0,1.0]}
-    #########
+    # Measurements provided by the user (width, depth, height) in metres
+    # target_dimensions_dict = {
+    #     'orange': [0.063, 0.065, 0.069],
+    #     'lemon': [0.067, 0.044, 0.047],
+    #     'pear': [0.063, 0.055, 0.1],
+    #     'tomato': [0.059, 0.0625, 0.060],
+    #     'capsicum': [0.075, 0.075, 0.09],
+    #     'potato': [0.082, 0.060, 0.062],
+    #     'pumpkin': [0.066, 0.058, 0.068],
+    #     'garlic': [0.060, 0.054, 0.075]
+    # }
 
-    # estimate target pose using bounding box and robot pose
-    target_class = obj_info[0]     # get predicted target label of the box
-    target_box = obj_info[1]       # get bounding box measures: [x,y,width,height]
-    true_height = target_dimensions_dict[target_class][2]   # look up true height of by class label
+    target_dimensions_dict = {
+        'orange': [0.0762, 0.073, 0.0700],
+        'lemon': [0.0727, 0.047, 0.0498],
+        'pear': [0.0780, 0.0721, 0.1080],
+        'tomato': [0.0680, 0.0691, 0.0593],
+        'capsicum':[0.0799, 0.0811, 0.0856],
+        'potato': [0.0920, 0.0672, 0.0572],
+        'pumpkin': [0.0780, 0.0814, 0.0726],
+        'garlic': [0.0550, 0.0621, 0.0700],
+    }
 
-    # compute pose of the target based on bounding box info, true object height, and robot's pose
-    pixel_height = target_box[3]
-    pixel_center = target_box[0]
-    distance = true_height/pixel_height * focal_length  # estimated distance between the robot and the centre of the image plane based on height
-    # training image size 320x240p
-    image_width = 320 # change this if your training image is in a different size (check details of pred_0.png taken by your robot)
-    x_shift = image_width/2 - pixel_center              # x distance between bounding box centre and centreline in camera view
-    theta = np.arctan(x_shift/focal_length)     # angle of object relative to the robot
-    ang = theta + robot_pose[2]     # angle of object in the world frame
-    
-   # relative object location
-    distance_obj = distance/np.cos(theta) # relative distance between robot and object
-    x_relative = distance_obj * np.cos(theta) # relative x pose
-    y_relative = distance_obj * np.sin(theta) # relative y pose
-    relative_pose = {'x': x_relative, 'y': y_relative}
-    #print(f'relative_pose: {relative_pose}')
+    # parse detection info
+    target_class = obj_info[0]
+    target_box = obj_info[1]  # expected [x_center, y_center, width, height] in pixels
 
-    # location of object in the world frame using rotation matrix
-    delta_x_world = x_relative * np.cos(robot_pose[2]) - y_relative * np.sin(robot_pose[2])
-    delta_y_world = x_relative * np.sin(robot_pose[2]) + y_relative * np.cos(robot_pose[2])
-    # add robot pose with delta target pose
-    target_pose = {'y': (robot_pose[1]+delta_y_world)[0],
-                   'x': (robot_pose[0]+delta_x_world)[0]}
-    #print(f'delta_x_world: {delta_x_world}, delta_y_world: {delta_y_world}')
-    #print(f'target_pose: {target_pose}')
+    if target_class not in target_dimensions_dict:
+        # unknown class, cannot estimate
+        return None
+
+    true_height = float(target_dimensions_dict[target_class][2])
+
+    # ensure numpy array to index correctly
+    box = np.asarray(target_box, dtype=float).ravel()
+    pixel_cx = float(box[0])    # x center in pixels
+    pixel_h = float(box[3])     # box height in pixels
+
+    if pixel_h <= 0:
+        return None
+
+    # estimate depth (z) using pinhole camera model: depth = (real_height * fy) / pixel_height
+    depth = (true_height * fy) / pixel_h
+
+    # compute lateral offset in camera frame (x to right is positive)
+    x_cam = (pixel_cx - cx) * depth / fx
+
+    # camera frame: forward = depth (z), right = x_cam
+    forward = depth
+    lateral = x_cam
+
+    # convert to world frame using robot_pose = [x, y, theta]
+    rob_x = float(robot_pose[0][0]) if hasattr(robot_pose[0], '__len__') else float(robot_pose[0])
+    rob_y = float(robot_pose[1][0]) if hasattr(robot_pose[1], '__len__') else float(robot_pose[1])
+    rob_theta = float(robot_pose[2][0]) if hasattr(robot_pose[2], '__len__') else float(robot_pose[2])
+
+    # delta in world frame
+    delta_x_world = forward * np.cos(rob_theta) - lateral * np.sin(rob_theta)
+    delta_y_world = forward * np.sin(rob_theta) + lateral * np.cos(rob_theta)
+
+    target_pose = {'x': rob_x + delta_x_world, 'y': rob_y + delta_y_world}
 
     return target_pose
 
@@ -86,11 +111,45 @@ def merge_estimations(target_pose_dict):
     """
     target_est = {}
 
-    ######### Replace with your codes #########
-    # TODO: replace it with a solution to merge the multiple occurrences of the same class type (e.g., by a distance threshold)
-    target_est = target_pose_dict
-    #########
-   
+    # Greedy spatial clustering per class using a distance threshold.
+    # Observations for a class are grouped if they are within `merge_threshold` metres of a cluster centre.
+    merge_threshold = 0.8  # 15 cm (as specified in lab notes)
+
+    # organize estimates by class base name (strip trailing _index)
+    per_class = {}
+    for k, pose in target_pose_dict.items():
+        if pose is None:
+            continue
+        # key format expected like 'orange_0' or similar
+        cls = k.split('_')[0].lower()
+        per_class.setdefault(cls, []).append((k, pose))
+
+    for cls, items in per_class.items():
+        clusters = []  # each cluster: {'count':int, 'sum_x':float, 'sum_y':float}
+        for name, pose in items:
+            x = float(pose['x'])
+            y = float(pose['y'])
+            placed = False
+            for c in clusters:
+                cx = c['sum_x'] / c['count']
+                cy = c['sum_y'] / c['count']
+                dist = np.hypot(x - cx, y - cy)
+                if dist <= merge_threshold:
+                    c['sum_x'] += x
+                    c['sum_y'] += y
+                    c['count'] += 1
+                    placed = True
+                    break
+            if not placed:
+                clusters.append({'sum_x': x, 'sum_y': y, 'count': 1})
+
+        # output cluster centres as final estimates
+        for i, c in enumerate(clusters):
+            cx = c['sum_x'] / c['count']
+            cy = c['sum_y'] / c['count']
+            key = f"{cls}_{i}"
+            target_est[key] = {'x': cx, 'y': cy}
+
     return target_est
 
 
@@ -103,7 +162,7 @@ if __name__ == "__main__":
     camera_matrix = np.loadtxt(fileK, delimiter=',')
 
     # init YOLO model
-    model_path = f'{script_dir}/YOLO/model/yolov8_model.pt'
+    model_path = f'{script_dir}/YOLO/model/bestv2.pt'
     yolo = Detector(model_path)
 
     # create a dictionary of all the saved images with their corresponding robot pose
@@ -119,16 +178,22 @@ if __name__ == "__main__":
     for image_path in image_poses.keys():
         input_image = cv2.imread(image_path)
         bounding_boxes, bbox_img = yolo.detect_single_image(input_image)
-        # cv2.imshow('bbox', bbox_img)
-        # cv2.waitKey(0)
+        cv2.imshow('bbox', bbox_img)
+        cv2.waitKey(0)
         robot_pose = image_poses[image_path]
 
         for detection in bounding_boxes:
             # count the occurrence of each target type
             occurrence = detected_type_list.count(detection[0])
-            target_pose_dict[f'{detection[0]}_{occurrence}'] = estimate_pose(camera_matrix, detection, robot_pose)
-
-            detected_type_list.append(detection[0])
+            est_pose = estimate_pose(camera_matrix, detection, robot_pose)
+            if est_pose is not None:
+                # Only count if within 0.3m of robot
+                rob_x = float(robot_pose[0][0]) if hasattr(robot_pose[0], '__len__') else float(robot_pose[0])
+                rob_y = float(robot_pose[1][0]) if hasattr(robot_pose[1], '__len__') else float(robot_pose[1])
+                dist = np.hypot(est_pose['x'] - rob_x, est_pose['y'] - rob_y)
+                if dist <= 0.3:
+                    target_pose_dict[f'{detection[0]}_{occurrence}'] = est_pose
+                    detected_type_list.append(detection[0])
 
     # merge the estimations of the targets so that there are at most 3 estimations of each target type
     target_est = {}
