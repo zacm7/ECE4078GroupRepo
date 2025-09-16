@@ -162,7 +162,7 @@ if __name__ == "__main__":
     camera_matrix = np.loadtxt(fileK, delimiter=',')
 
     # init YOLO model
-    model_path = f'{script_dir}/YOLO/model/bestv2.pt'
+    model_path = f'{script_dir}/YOLO/model/bestv5.pt'
     yolo = Detector(model_path)
 
     # create a dictionary of all the saved images with their corresponding robot pose
