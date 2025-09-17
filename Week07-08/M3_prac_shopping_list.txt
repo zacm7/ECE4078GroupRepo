@@ -1,5 +1,5 @@
-garlic
-lemon
 pear
 tomato
 pumpkin
+garlic
+lemon

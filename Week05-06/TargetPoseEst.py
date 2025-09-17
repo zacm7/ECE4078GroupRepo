@@ -113,7 +113,7 @@ def merge_estimations(target_pose_dict):
 
     # Greedy spatial clustering per class using a distance threshold.
     # Observations for a class are grouped if they are within `merge_threshold` metres of a cluster centre.
-    merge_threshold = 0.8  # 15 cm (as specified in lab notes)
+    merge_threshold = 0.0  # 15 cm (as specified in lab notes)
 
     # organize estimates by class base name (strip trailing _index)
     per_class = {}
@@ -191,7 +191,7 @@ if __name__ == "__main__":
                 rob_x = float(robot_pose[0][0]) if hasattr(robot_pose[0], '__len__') else float(robot_pose[0])
                 rob_y = float(robot_pose[1][0]) if hasattr(robot_pose[1], '__len__') else float(robot_pose[1])
                 dist = np.hypot(est_pose['x'] - rob_x, est_pose['y'] - rob_y)
-                if dist <= 0.3:
+                if dist <= 10.0:
                     target_pose_dict[f'{detection[0]}_{occurrence}'] = est_pose
                     detected_type_list.append(detection[0])
 
