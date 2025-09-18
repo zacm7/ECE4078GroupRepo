@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import sys
 import argparse
@@ -60,9 +61,11 @@ class AutoOperateDynamic(Operate):
 
         # Planning model
         self.search_list = [s.lower() for s in search_list]
+        # remaining_targets holds world positions of targets in order
         self.remaining_targets: List[List[float]] = [list(t) for t in targets_xy]
-        # Keep labels aligned with remaining_targets for alignment logic
+        # remaining_labels keeps the same order but stores the class label for each target
         self.remaining_labels: List[str] = [s.lower() for s in search_list]
+
         self.known_obstacles: List[List[float]] = [list(o) for o in aruco_obstacles_xy]
         self.discovered_obstacles: List[List[float]] = []
 
@@ -76,7 +79,8 @@ class AutoOperateDynamic(Operate):
         self.current_goal: List[float] | None = None
         self.reached_time: float | None = None
         self.active = True
-        self.dist_tol = 0.1
+        # waypoint arrival tolerance (meters)
+        self.dist_tol = 0.10
         self.angle_tol = math.radians(8.0)
         self.turn_cmd = 1
         self.fwd_cmd = 1
@@ -92,18 +96,17 @@ class AutoOperateDynamic(Operate):
         self.add_cooldown = 0.5  # seconds
         self.min_obs_separation = 0.15  # m
 
-        # Visual alignment near target (uses detector_output)
-        self.aligning = False
-        self.align_start_time = 0.0
-        self.align_timeout = 5.0  # seconds
-        self.center_tol_px = 15.0  # acceptable horizontal pixel error
-        self.close_width_px = 110.0  # consider close enough when bbox is wide
-        self._align_scan_dir = 1
-
-        # Cache intrinsics
+        # Cache intrinsics (for projection of bbox -> world)
         self.K = getattr(self.ekf.robot, 'camera_matrix', None)
         self.cx = float(self.K[0, 2]) if self.K is not None else 160.0
         self.fx = float(self.K[0, 0]) if self.K is not None else 320.0
+
+        # Post-hold backoff to avoid bumping the fruit when turning
+        self.backoff_active = False
+        self.backoff_start_time = 0.0
+        self.backoff_duration = 1  # seconds to reverse
+        self.backoff_speed = 0.6    # reverse speed (same scale as fwd_cmd)
+        self._advance_after_backoff = False
 
     # ============= Navigation primitives =============
     def get_pose(self) -> Tuple[float, float, float]:
@@ -113,13 +116,10 @@ class AutoOperateDynamic(Operate):
                 x = float(robot.state[0, 0])
                 y = float(robot.state[1, 0])
                 th = float(robot.state[2, 0])
-                print(f"Robot pose: x={x}, y={y}, th={th}")
                 return x, y, th
-        # Keep Level 2 behavior for consistency
-        print("ERROR UNKNOWN POSITIONS")
         return 0.0, 0.0, 0.0
 
-    def pick_next_goal(self): #uses self.waypoints and sets it as current_goal
+    def pick_next_goal(self):
         if not self.waypoints:
             self.current_goal = None
             return
@@ -127,14 +127,31 @@ class AutoOperateDynamic(Operate):
         self.reached_time = None
         self.notification = f'Navigating to: [{self.current_goal[0]:.2f}, {self.current_goal[1]:.2f}]'
 
-    def auto_nav_step(self): #main loop for navigation
+    def auto_nav_step(self):
         # Require SLAM
         if not self.ekf_on:
             self.command['motion'] = [0, 0]
             self.notification = 'Press ENTER to start SLAM'
             return
 
-        # Marker acquisition gate: scan and occasional creep until >=2 tags visible (same as L2)
+        # Handle post-hold backoff
+        if getattr(self, 'backoff_active', False):
+            now = time.time()
+            if now - self.backoff_start_time < self.backoff_duration:
+                self.command['motion'] = [-self.backoff_speed, 0]
+                self.notification = 'Backing off from target'
+                return
+            # Backoff complete -> stop and advance
+            self.backoff_active = False
+            self.command['motion'] = [0, 0]
+            if self._advance_after_backoff:
+                self._advance_after_backoff = False
+                self._advance_target()
+                self.replan(initial=False)
+                self.pick_next_goal()
+            return
+
+        # Marker acquisition gate: scan and occasional creep until >=2 tags visible
         tag_count = len(getattr(self.ekf, 'taglist', []))
         now = time.time()
         if tag_count < 2:
@@ -177,7 +194,7 @@ class AutoOperateDynamic(Operate):
             self.command['motion'] = [0, 0]
             return
 
-        # Control to goal (same policy as L2)
+        # Control to goal
         x, y, th = self.get_pose()
         gx, gy = self.current_goal
         dx, dy = gx - x, gy - y
@@ -185,36 +202,20 @@ class AutoOperateDynamic(Operate):
         bearing = math.atan2(dy, dx)
         dheading = angle_diff(bearing, th)
 
-        # Arrival handling: if this goal is close to the next target, align visually then hold; else skip hold
+        # Arrival handling: if this goal is close to the next target, hold; else skip hold
         if dist <= self.dist_tol:
             if self._is_close_to_current_target([gx, gy]):
-                # Start alignment state on first arrival
-                if not self.aligning:
-                    self.aligning = True
-                    self.align_start_time = time.time()
-                    self._align_scan_dir = 1
-
-                # Run alignment until centered/close or timeout
-                if self.aligning and (time.time() - self.align_start_time) <= self.align_timeout:
-                    if self._align_to_target_step():
-                        self.aligning = False
-                    else:
-                        self.notification = 'Aligning to target...'
-                        return
-                else:
-                    # Timeout or done
-                    self.aligning = False
-
-                # Once aligned (or timed out), perform brief hold
                 if self.reached_time is None:
                     self.reached_time = time.time()
                     self.notification = f'Reached target [{gx:.2f}, {gy:.2f}]. Holding...'
                 self.command['motion'] = [0, 0]
                 if time.time() - self.reached_time >= 2.0:
-                    self.notification = f'Completed target [{gx:.2f}, {gy:.2f}]'
-                    self._advance_target()
-                    self.replan(initial=False)
-                    self.pick_next_goal()
+                    # Start a brief reverse before advancing to the next target
+                    self.backoff_active = True
+                    self.backoff_start_time = time.time()
+                    self._advance_after_backoff = True
+                    self.notification = f'Backing off from [{gx:.2f}, {gy:.2f}] before next target'
+                    self.command['motion'] = [-self.backoff_speed, 0]
                 return
             else:
                 self.pick_next_goal()
@@ -222,6 +223,7 @@ class AutoOperateDynamic(Operate):
 
         # Turn-then-drive
         if abs(dheading) > self.angle_tol:
+            # Rotate in place to reduce heading error before moving
             self.command['motion'] = [0, self.turn_cmd if dheading > 0 else -self.turn_cmd]
         else:
             self.command['motion'] = [self.fwd_cmd, 0]
@@ -261,8 +263,7 @@ class AutoOperateDynamic(Operate):
         self.remaining_targets.pop(0)
         if hasattr(self, 'remaining_labels') and self.remaining_labels:
             self.remaining_labels.pop(0)
-        # Reset alignment state when target advances
-        self.aligning = False
+        # Reset timing state when target advances
         self.reached_time = None
         if not self.remaining_targets:
             self.waypoints = []
@@ -289,8 +290,12 @@ class AutoOperateDynamic(Operate):
         x, y, th = self.get_pose()
         cx, fx = self.cx, self.fx
 
-        # Copy remaining targets to avoid blocking them as obstacles
+        # Copy remaining targets to avoid blocking them as obstacles where appropriate
+        # Note: we will only *ignore* detections that correspond to the current target (index 0).
         known_targets = self.remaining_targets[:]
+
+        # tolerance for matching detection to the current target (meters)
+        target_match_tol = 0.30
 
         for det in bboxes:
             try:
@@ -300,10 +305,6 @@ class AutoOperateDynamic(Operate):
             except Exception:
                 continue
             if conf < 0.4:
-                continue
-
-            if label in self.search_list:
-                # It's a target class; don't treat as obstacle
                 continue
 
             # Project detection center to a rough world point
@@ -319,8 +320,32 @@ class AutoOperateDynamic(Operate):
             ox = x + d * math.cos(bearing)
             oy = y + d * math.sin(bearing)
 
-            # Ignore if too close to a known target position
-            if any(math.hypot(ox - tx, oy - ty) <= 0.30 for tx, ty in known_targets):
+            # ===== NEW BEHAVIOR: only ignore detection if it corresponds to the CURRENT target =====
+            if label in self.search_list:
+                # Is there a current target?
+                if len(self.remaining_targets) > 0 and len(self.remaining_labels) > 0:
+                    current_label = str(self.remaining_labels[0]).lower()
+                    if label == current_label:
+                        # If the detection is close enough to the known current-target position,
+                        # it's likely the same target — ignore it as obstacle.
+                        tx, ty = self.remaining_targets[0]
+                        if math.hypot(ox - tx, oy - ty) <= target_match_tol:
+                            # This detection corresponds to current target -> ignore as obstacle
+                            continue
+                        # else: detection of same label but not near current target -> treat as obstacle
+                    else:
+                        # detection is a shopping-list class but NOT the current target -> treat as obstacle
+                        pass
+                else:
+                    # no reliable remaining_targets/labels -> conservatively treat detected shopping-list
+                    # classes as obstacles (safe fallback)
+                    pass
+
+            # If close to a known target (other than the special-case above), ignore to avoid false positives
+            # (But note: we intentionally let non-current shopping-list detections get treated as obstacles.
+            #  This check prevents marking an obstacle if it's *very* close to a known target centre.)
+            if any(math.hypot(ox - tx, oy - ty) <= 0.10 for tx, ty in known_targets):
+                # Very close to a known target centre -> skip adding (avoids tiny projection noise)
                 continue
 
             # Ignore duplicates amongst known and discovered obstacles
@@ -332,76 +357,13 @@ class AutoOperateDynamic(Operate):
             if now - self.last_obstacle_add_time < self.add_cooldown:
                 continue
 
+            # Add obstacle and mark for replanning
             self.discovered_obstacles.append([ox, oy])
             self.last_obstacle_add_time = now
             new_added = True
 
         if new_added and self.ekf_on and self.active:
             self.replan(initial=False)
-
-    # ============= Alignment helpers =============
-    def _current_target_label(self) -> str:
-        try:
-            return str(self.remaining_labels[0]).lower()
-        except Exception:
-            return ""
-
-    def _find_detection_for_label(self, label: str):
-        bboxes = getattr(self, 'detector_output', None)
-        if not isinstance(bboxes, (list, tuple)) or len(bboxes) == 0:
-            return None
-        best = None
-        best_conf = -1.0
-        for det in bboxes:
-            try:
-                det_label = str(det[0]).lower()
-                xywh = np.asarray(det[1]).astype(float)
-                conf = float(det[2])
-            except Exception:
-                continue
-            if det_label != label:
-                continue
-            if conf > best_conf:
-                best_conf = conf
-                best = (float(xywh[0]), float(xywh[2]), conf)
-        return best  # (u, w_px, conf) or None
-
-    def _align_to_target_step(self) -> bool:
-        """Return True when aligned/close; else command motion for alignment and return False."""
-        label = self._current_target_label()
-        if not label:
-            self.command['motion'] = [0, 0]
-            return True
-
-        found = self._find_detection_for_label(label)
-        cx = self.cx
-        if found is None:
-            # Slow scan left/right while near target
-            now = time.time()
-            # toggle direction every ~1s to avoid spinning
-            if int(now - self.align_start_time) % 2 == 0:
-                self._align_scan_dir = 1
-            else:
-                self._align_scan_dir = -1
-            self.command['motion'] = [0, self._align_scan_dir * self.turn_cmd]
-            return False
-
-        u, w_px, conf = found
-        dx = u - cx
-        # Step 1: center horizontally
-        if abs(dx) > self.center_tol_px:
-            turn = self.turn_cmd if dx > 0 else -self.turn_cmd
-            self.command['motion'] = [0, turn]
-            return False
-
-        # Step 2: close-in a little if still far (bbox not wide enough)
-        if w_px < self.close_width_px:
-            self.command['motion'] = [self.fwd_cmd, 0]
-            return False
-
-        # Centered and close enough
-        self.command['motion'] = [0, 0]
-        return True
 
 
 if __name__ == "__main__":
@@ -436,7 +398,10 @@ if __name__ == "__main__":
     width, height = 700, 660
     canvas = pygame.display.set_mode((width, height))
     pygame.display.set_caption('ECE4078 - Auto Fruit Search (L3)')
-    pygame.display.set_icon(pygame.image.load(os.path.join(WEEK0506_DIR, 'pics', '8bit', 'pibot5.png')))
+    try:
+        pygame.display.set_icon(pygame.image.load(os.path.join(WEEK0506_DIR, 'pics', '8bit', 'pibot5.png')))
+    except Exception:
+        pass
     canvas.fill((0, 0, 0))
 
     # Load partial map + shopping list, print targets
@@ -445,10 +410,8 @@ if __name__ == "__main__":
     print_target_fruits_pos(search_list, fruit_list, fruit_pos)
 
     # Build targets (in order) from partial map; obstacles initially only ArUcos
-    # For partial map, fruit_list/fruit_pos already contain exactly the targets listed in search_list (one each)
     targets_xy: List[List[float]] = []
     for ft in search_list:
-        # find first match of type in fruit_list
         found = False
         for i, name in enumerate(fruit_list):
             if name == ft:
@@ -483,4 +446,3 @@ if __name__ == "__main__":
         operate.periodic_perception_update()  # add obstacles + replan if needed
         operate.draw(canvas)
         pygame.display.update()
-
