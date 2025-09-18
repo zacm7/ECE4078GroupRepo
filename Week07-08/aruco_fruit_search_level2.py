@@ -177,7 +177,7 @@ if __name__ == "__main__":
     parser.add_argument("--list", type=str, default=os.path.join(SCRIPT_DIR, "M3_prac_shopping_list.txt"))
     parser.add_argument("--grid_res", type=float, default=0.02)
     parser.add_argument("--robot_radius", type=float, default=0.12)
-    parser.add_argument("--safety_margin", type=float, default=0.05)
+    parser.add_argument("--safety_margin", type=float, default=0.1)
     parser.add_argument("--play_data", action='store_true')
     parser.add_argument("--save_data", action='store_true')
     args, _ = parser.parse_known_args()

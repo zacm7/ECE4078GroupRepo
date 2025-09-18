@@ -61,6 +61,8 @@ class AutoOperateDynamic(Operate):
         # Planning model
         self.search_list = [s.lower() for s in search_list]
         self.remaining_targets: List[List[float]] = [list(t) for t in targets_xy]
+        # Keep labels aligned with remaining_targets for alignment logic
+        self.remaining_labels: List[str] = [s.lower() for s in search_list]
         self.known_obstacles: List[List[float]] = [list(o) for o in aruco_obstacles_xy]
         self.discovered_obstacles: List[List[float]] = []
 
@@ -69,37 +71,55 @@ class AutoOperateDynamic(Operate):
         self.robot_radius = robot_radius
         self.safety_margin = safety_margin
 
-        # Controller params
+        # Controller params (mirror Level 2)
         self.waypoints: List[List[float]] = []
         self.current_goal: List[float] | None = None
         self.reached_time: float | None = None
         self.active = True
-        self.dist_tol = 0.25
+        self.dist_tol = 0.1
         self.angle_tol = math.radians(8.0)
         self.turn_cmd = 1
         self.fwd_cmd = 1
+
+        # Marker acquisition (scan/creep) state
+        self._scan_start = None
+        self._scan_dir = 1
+        self._creep_until = None
+        self._planned_once = False
 
         # Detection handling
         self.last_obstacle_add_time = 0.0
         self.add_cooldown = 0.5  # seconds
         self.min_obs_separation = 0.15  # m
 
+        # Visual alignment near target (uses detector_output)
+        self.aligning = False
+        self.align_start_time = 0.0
+        self.align_timeout = 5.0  # seconds
+        self.center_tol_px = 15.0  # acceptable horizontal pixel error
+        self.close_width_px = 110.0  # consider close enough when bbox is wide
+        self._align_scan_dir = 1
+
         # Cache intrinsics
         self.K = getattr(self.ekf.robot, 'camera_matrix', None)
         self.cx = float(self.K[0, 2]) if self.K is not None else 160.0
         self.fx = float(self.K[0, 0]) if self.K is not None else 320.0
 
-        # Initial plan from origin; will replan once SLAM stabilizes too
-        self.replan(initial=True)
-
     # ============= Navigation primitives =============
     def get_pose(self) -> Tuple[float, float, float]:
-        mu = getattr(self.ekf, "mu", None)
-        if mu is not None and len(mu) >= 3:
-            return float(mu[0]), float(mu[1]), float(mu[2])
+        if hasattr(self, "ekf") and self.ekf is not None:
+            robot = getattr(self.ekf, "robot", None)
+            if robot is not None and hasattr(robot, "state") and robot.state.shape[0] >= 3:
+                x = float(robot.state[0, 0])
+                y = float(robot.state[1, 0])
+                th = float(robot.state[2, 0])
+                print(f"Robot pose: x={x}, y={y}, th={th}")
+                return x, y, th
+        # Keep Level 2 behavior for consistency
+        print("ERROR UNKNOWN POSITIONS")
         return 0.0, 0.0, 0.0
 
-    def pick_next_goal(self):
+    def pick_next_goal(self): #uses self.waypoints and sets it as current_goal
         if not self.waypoints:
             self.current_goal = None
             return
@@ -107,19 +127,57 @@ class AutoOperateDynamic(Operate):
         self.reached_time = None
         self.notification = f'Navigating to: [{self.current_goal[0]:.2f}, {self.current_goal[1]:.2f}]'
 
-    def auto_nav_step(self):
-        # Require SLAM running
+    def auto_nav_step(self): #main loop for navigation
+        # Require SLAM
         if not self.ekf_on:
             self.command['motion'] = [0, 0]
             self.notification = 'Press ENTER to start SLAM'
             return
-        # Initialize goal if needed
+
+        # Marker acquisition gate: scan and occasional creep until >=2 tags visible (same as L2)
+        tag_count = len(getattr(self.ekf, 'taglist', []))
+        now = time.time()
+        if tag_count < 2:
+            if self._scan_start is None:
+                self._scan_start = now
+                self._scan_dir = 1
+                self._creep_until = None
+            # Creep interval active
+            if self._creep_until and now < self._creep_until:
+                self.command['motion'] = [self.fwd_cmd, 0]
+                self.notification = 'Looking for markers: creeping forward'
+                return
+            # After 6s of scanning, creep forward for 1s
+            elapsed = now - self._scan_start
+            if elapsed > 6.0:
+                self._creep_until = now + 1.0
+                self._scan_start = now
+                self.command['motion'] = [self.fwd_cmd, 0]
+                self.notification = 'Looking for markers: creeping forward'
+                return
+            # Alternate scan direction every ~2s
+            self._scan_dir = 1 if int(elapsed // 2) % 2 == 0 else -1
+            self.command['motion'] = [0, self._scan_dir * self.turn_cmd]
+            self.notification = 'Looking for markers: scanning'
+            return
+        else:
+            # Reset scanning state when we have enough tags
+            self._scan_start = None
+            self._creep_until = None
+
+        # Ensure we have a plan from current pose to remaining targets
+        if (not self._planned_once and self.active) or (self.active and not self.waypoints):
+            self.replan(initial=not self._planned_once)
+            self._planned_once = True
+
+        # Get/set goal
         if self.current_goal is None and self.active:
             self.pick_next_goal()
         if not self.current_goal:
             self.command['motion'] = [0, 0]
             return
 
+        # Control to goal (same policy as L2)
         x, y, th = self.get_pose()
         gx, gy = self.current_goal
         dx, dy = gx - x, gy - y
@@ -127,18 +185,40 @@ class AutoOperateDynamic(Operate):
         bearing = math.atan2(dy, dx)
         dheading = angle_diff(bearing, th)
 
-        # Arrival (hold 2s)
+        # Arrival handling: if this goal is close to the next target, align visually then hold; else skip hold
         if dist <= self.dist_tol:
-            if self.reached_time is None:
-                self.reached_time = time.time()
-                self.notification = f'Reached [{gx:.2f}, {gy:.2f}]. Holding...'
-            self.command['motion'] = [0, 0]
-            if time.time() - self.reached_time >= 2.0:
-                self.notification = f'Completed [{gx:.2f}, {gy:.2f}]'
-                # If this goal corresponds exactly to the next target, and we're close, we can pop targets
-                self._maybe_advance_target([gx, gy])
+            if self._is_close_to_current_target([gx, gy]):
+                # Start alignment state on first arrival
+                if not self.aligning:
+                    self.aligning = True
+                    self.align_start_time = time.time()
+                    self._align_scan_dir = 1
+
+                # Run alignment until centered/close or timeout
+                if self.aligning and (time.time() - self.align_start_time) <= self.align_timeout:
+                    if self._align_to_target_step():
+                        self.aligning = False
+                    else:
+                        self.notification = 'Aligning to target...'
+                        return
+                else:
+                    # Timeout or done
+                    self.aligning = False
+
+                # Once aligned (or timed out), perform brief hold
+                if self.reached_time is None:
+                    self.reached_time = time.time()
+                    self.notification = f'Reached target [{gx:.2f}, {gy:.2f}]. Holding...'
+                self.command['motion'] = [0, 0]
+                if time.time() - self.reached_time >= 2.0:
+                    self.notification = f'Completed target [{gx:.2f}, {gy:.2f}]'
+                    self._advance_target()
+                    self.replan(initial=False)
+                    self.pick_next_goal()
+                return
+            else:
                 self.pick_next_goal()
-            return
+                return
 
         # Turn-then-drive
         if abs(dheading) > self.angle_tol:
@@ -151,15 +231,15 @@ class AutoOperateDynamic(Operate):
         """Plan waypoints from current pose to remaining targets, avoiding known+discovered obstacles."""
         if not self.active:
             return
-        x, y, _ = self.get_pose()
-        robot_xy = [x, y]
-        obstacles_xy = self.known_obstacles + self.discovered_obstacles
         if not self.remaining_targets:
             self.waypoints = []
             self.current_goal = None
             self.active = False
             self.notification = 'All targets completed'
             return
+        x, y, _ = self.get_pose()
+        robot_xy = [x, y]
+        obstacles_xy = self.known_obstacles + self.discovered_obstacles
         try:
             new_waypoints = plan_waypoints(robot_xy, self.remaining_targets, obstacles_xy,
                                            grid_res=self.grid_res,
@@ -174,26 +254,31 @@ class AutoOperateDynamic(Operate):
         except Exception as e:
             self.notification = f'Planning failed: {e}'
 
-    def _maybe_advance_target(self, reached_xy: List[float]):
+    def _advance_target(self):
         if not self.remaining_targets:
             return
+        # Remove the front target as completed
+        self.remaining_targets.pop(0)
+        if hasattr(self, 'remaining_labels') and self.remaining_labels:
+            self.remaining_labels.pop(0)
+        # Reset alignment state when target advances
+        self.aligning = False
+        self.reached_time = None
+        if not self.remaining_targets:
+            self.waypoints = []
+            self.current_goal = None
+            self.active = False
+            self.notification = 'All targets completed'
+
+    def _is_close_to_current_target(self, goal_xy: List[float]) -> bool:
+        if not self.remaining_targets:
+            return False
         tx, ty = self.remaining_targets[0]
-        if math.hypot(reached_xy[0] - tx, reached_xy[1] - ty) <= self.dist_tol:
-            # Pop reached target
-            self.remaining_targets.pop(0)
-            # Trigger replan for subsequent targets
-            if self.remaining_targets:
-                self.replan(initial=False)
-            else:
-                self.waypoints = []
-                self.current_goal = None
-                self.active = False
-                self.notification = 'All targets completed'
+        return math.hypot(goal_xy[0] - tx, goal_xy[1] - ty) <= max(0.12, self.grid_res * 3)
 
     # ============= Perception integration =============
     def periodic_perception_update(self):
         """Process detector outputs to add unknown obstacles, and replan if new obstacles observed."""
-        # YOLO outputs saved on operate.detector_output by Operate.detect_target()
         bboxes = getattr(self, 'detector_output', None)
         if not isinstance(bboxes, (list, tuple)) or len(bboxes) == 0:
             return
@@ -204,8 +289,8 @@ class AutoOperateDynamic(Operate):
         x, y, th = self.get_pose()
         cx, fx = self.cx, self.fx
 
-        # Known targets (to avoid misclassifying them as obstacles)
-        known_targets = self.remaining_targets[:]  # ignore already completed
+        # Copy remaining targets to avoid blocking them as obstacles
+        known_targets = self.remaining_targets[:]
 
         for det in bboxes:
             try:
@@ -217,21 +302,15 @@ class AutoOperateDynamic(Operate):
             if conf < 0.4:
                 continue
 
-            # If label is a target type, we ignore it as an obstacle (its position already known from partial map)
-            # However, duplicates of a target type could exist as obstacles (rare in provided setting). If desired,
-            # enable the below check to consider far-from-known-target duplicates as obstacles.
             if label in self.search_list:
-                # Skip classifying as obstacle near any known target of that type (<= 0.3 m)
-                # We don't keep per-type positions here; partial map has exactly one per target type.
+                # It's a target class; don't treat as obstacle
                 continue
 
-            # Project detection to a world point using a naive pinhole model
-            u = float(xywh[0])  # bbox center x in pixels
+            # Project detection center to a rough world point
+            u = float(xywh[0])
             w_px = float(xywh[2])
-            # Horizontal bearing offset from camera optical axis
             alpha = math.atan((u - cx) / fx)
             bearing = th + alpha
-            # Distance heuristic: d ≈ fx * W / w_px (assume avg fruit width W ~ 0.10m); clamp
             W_assumed = 0.10
             if w_px <= 1.0:
                 d = 0.5
@@ -240,28 +319,89 @@ class AutoOperateDynamic(Operate):
             ox = x + d * math.cos(bearing)
             oy = y + d * math.sin(bearing)
 
-            # If close to a known target, ignore
-            too_close_to_target = any(math.hypot(ox - tx, oy - ty) <= 0.30 for tx, ty in known_targets)
-            if too_close_to_target:
+            # Ignore if too close to a known target position
+            if any(math.hypot(ox - tx, oy - ty) <= 0.30 for tx, ty in known_targets):
                 continue
 
-            # If duplicate obstacle, ignore
+            # Ignore duplicates amongst known and discovered obstacles
             all_obs = self.known_obstacles + self.discovered_obstacles
-            is_duplicate = any(math.hypot(ox - qx, oy - qy) <= self.min_obs_separation for qx, qy in all_obs)
-            if is_duplicate:
+            if any(math.hypot(ox - qx, oy - qy) <= self.min_obs_separation for qx, qy in all_obs):
                 continue
 
-            # Cooldown to avoid spamming
+            # Rate limit
             if now - self.last_obstacle_add_time < self.add_cooldown:
                 continue
 
-            # Add obstacle and mark for replanning
             self.discovered_obstacles.append([ox, oy])
             self.last_obstacle_add_time = now
             new_added = True
 
-        if new_added and self.ekf_on:
+        if new_added and self.ekf_on and self.active:
             self.replan(initial=False)
+
+    # ============= Alignment helpers =============
+    def _current_target_label(self) -> str:
+        try:
+            return str(self.remaining_labels[0]).lower()
+        except Exception:
+            return ""
+
+    def _find_detection_for_label(self, label: str):
+        bboxes = getattr(self, 'detector_output', None)
+        if not isinstance(bboxes, (list, tuple)) or len(bboxes) == 0:
+            return None
+        best = None
+        best_conf = -1.0
+        for det in bboxes:
+            try:
+                det_label = str(det[0]).lower()
+                xywh = np.asarray(det[1]).astype(float)
+                conf = float(det[2])
+            except Exception:
+                continue
+            if det_label != label:
+                continue
+            if conf > best_conf:
+                best_conf = conf
+                best = (float(xywh[0]), float(xywh[2]), conf)
+        return best  # (u, w_px, conf) or None
+
+    def _align_to_target_step(self) -> bool:
+        """Return True when aligned/close; else command motion for alignment and return False."""
+        label = self._current_target_label()
+        if not label:
+            self.command['motion'] = [0, 0]
+            return True
+
+        found = self._find_detection_for_label(label)
+        cx = self.cx
+        if found is None:
+            # Slow scan left/right while near target
+            now = time.time()
+            # toggle direction every ~1s to avoid spinning
+            if int(now - self.align_start_time) % 2 == 0:
+                self._align_scan_dir = 1
+            else:
+                self._align_scan_dir = -1
+            self.command['motion'] = [0, self._align_scan_dir * self.turn_cmd]
+            return False
+
+        u, w_px, conf = found
+        dx = u - cx
+        # Step 1: center horizontally
+        if abs(dx) > self.center_tol_px:
+            turn = self.turn_cmd if dx > 0 else -self.turn_cmd
+            self.command['motion'] = [0, turn]
+            return False
+
+        # Step 2: close-in a little if still far (bbox not wide enough)
+        if w_px < self.close_width_px:
+            self.command['motion'] = [self.fwd_cmd, 0]
+            return False
+
+        # Centered and close enough
+        self.command['motion'] = [0, 0]
+        return True
 
 
 if __name__ == "__main__":
@@ -274,7 +414,7 @@ if __name__ == "__main__":
     parser.add_argument("--list", type=str, default=os.path.join(SCRIPT_DIR, "M3_prac_shopping_list.txt"))
     parser.add_argument("--grid_res", type=float, default=0.02)
     parser.add_argument("--robot_radius", type=float, default=0.12)
-    parser.add_argument("--safety_margin", type=float, default=0.05)
+    parser.add_argument("--safety_margin", type=float, default=0.15)
     parser.add_argument("--play_data", action='store_true')
     parser.add_argument("--save_data", action='store_true')
     args, _ = parser.parse_known_args()
@@ -343,3 +483,4 @@ if __name__ == "__main__":
         operate.periodic_perception_update()  # add obstacles + replan if needed
         operate.draw(canvas)
         pygame.display.update()
+
