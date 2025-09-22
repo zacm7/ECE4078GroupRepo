@@ -75,9 +75,9 @@ class AutoOperateDynamic(Operate):
         self.safety_margin = safety_margin
 
         # Controller params (mirror Level 2)
-        self.waypoints: List[List[float]] = []
-        self.current_goal: List[float] | None = None
-        self.reached_time: float | None = None
+        self.waypoints = []  # type: List[List[float]]
+        self.current_goal = None  # type: List[float] | None
+        self.reached_time = None
         self.active = True
         # waypoint arrival tolerance (meters)
         self.dist_tol = 0.10
@@ -93,7 +93,8 @@ class AutoOperateDynamic(Operate):
 
         # Detection handling
         self.last_obstacle_add_time = 0.0
-        self.add_cooldown = 0.5  # seconds
+        # React faster to new obstacles
+        self.add_cooldown = 0.2  # seconds
         self.min_obs_separation = 0.15  # m
 
         # Cache intrinsics (for projection of bbox -> world)
@@ -101,12 +102,23 @@ class AutoOperateDynamic(Operate):
         self.cx = float(self.K[0, 2]) if self.K is not None else 160.0
         self.fx = float(self.K[0, 0]) if self.K is not None else 320.0
 
-        # Post-hold backoff to avoid bumping the fruit when turning
+        # Target arrival + backoff to avoid bumping the fruit when turning
+        self.target_hold_radius = 0.25  # meters (marking requirement)
         self.backoff_active = False
         self.backoff_start_time = 0.0
         self.backoff_duration = 1  # seconds to reverse
         self.backoff_speed = 0.6    # reverse speed (same scale as fwd_cmd)
         self._advance_after_backoff = False
+
+        # Startup 360° scan: pause every 30° for 0.5s to acquire markers/fruits
+        self.startup_scan_enabled = True
+        self._startup_scan_done = False
+        self._scan_step_rad = math.radians(30.0)
+        self._scan_pause = 0.5  # seconds per stop
+        self._scan_total_steps = int(round(2 * math.pi / self._scan_step_rad))
+        self._scan_steps_done = 0
+        self._scan_target_heading = None
+        self._scan_pause_until = None
 
     # ============= Navigation primitives =============
     def get_pose(self) -> Tuple[float, float, float]:
@@ -132,6 +144,11 @@ class AutoOperateDynamic(Operate):
         if not self.ekf_on:
             self.command['motion'] = [0, 0]
             self.notification = 'Press ENTER to start SLAM'
+            return
+
+        # Startup scan routine (run once): rotate 360° in steps and pause to stabilize detections
+        if self.startup_scan_enabled and not self._startup_scan_done:
+            self._do_startup_scan()
             return
 
         # Handle post-hold backoff
@@ -196,11 +213,41 @@ class AutoOperateDynamic(Operate):
 
         # Control to goal
         x, y, th = self.get_pose()
+        # Local safety: if too close to any obstacle, stop and replan
+        if self.active:
+            all_obs = self.known_obstacles + self.discovered_obstacles
+            if all_obs:
+                dmin = min(math.hypot(x - ox, y - oy) for (ox, oy) in all_obs)
+                # stop if within (robot_radius + small buffer)
+                if dmin < (self.robot_radius + 0.05):
+                    self.command['motion'] = [0, 0]
+                    self.notification = 'Too close to obstacle — stopping and replanning'
+                    self.replan(initial=False)
+                    return
+
         gx, gy = self.current_goal
         dx, dy = gx - x, gy - y
         dist = math.hypot(dx, dy)
         bearing = math.atan2(dy, dx)
         dheading = angle_diff(bearing, th)
+
+        # If we are within hold radius of the true target, stop/hold even if goal is slightly offset
+        if self.remaining_targets:
+            tx, ty = self.remaining_targets[0]
+            dist_to_target = math.hypot(tx - x, ty - y)
+            if dist_to_target <= self.target_hold_radius:
+                if self.reached_time is None:
+                    self.reached_time = time.time()
+                    self.notification = f'Reached target [{tx:.2f}, {ty:.2f}] (within {self.target_hold_radius:.2f}m). Holding...'
+                self.command['motion'] = [0, 0]
+                if time.time() - self.reached_time >= 2.0:
+                    # Start a brief reverse before advancing to the next target
+                    self.backoff_active = True
+                    self.backoff_start_time = time.time()
+                    self._advance_after_backoff = True
+                    self.notification = f'Backing off from target before next target'
+                    self.command['motion'] = [-self.backoff_speed, 0]
+                return
 
         # Arrival handling: if this goal is close to the next target, hold; else skip hold
         if dist <= self.dist_tol:
@@ -228,6 +275,53 @@ class AutoOperateDynamic(Operate):
         else:
             self.command['motion'] = [self.fwd_cmd, 0]
 
+    def _do_startup_scan(self):
+        """Rotate 360° in 30° steps, pausing at each step to stabilize detections and SLAM.
+        Runs once at startup if enabled. Uses ekf robot heading as feedback."""
+        # If we already completed the scan, return
+        if self._startup_scan_done:
+            return
+        # If we've done all steps, finish
+        if self._scan_steps_done >= self._scan_total_steps:
+            self._startup_scan_done = True
+            self.notification = 'Startup scan complete'
+            self.command['motion'] = [0, 0]
+            return
+
+        # Read current heading
+        _, _, th = self.get_pose()
+        now = time.time()
+
+        # If we are in a pause window, hold still
+        if self._scan_pause_until is not None and now < self._scan_pause_until:
+            # Hold perfectly still during pause
+            self.command['motion'] = [0, 0]
+            self.notification = 'Startup scan: pausing'
+            return
+        else:
+            # End pause
+            self._scan_pause_until = None
+
+        # If no target heading yet, set the next one relative to current
+        if self._scan_target_heading is None:
+            self._scan_target_heading = normalize_angle(th + self._scan_step_rad)
+
+        # Compute smallest signed angle from th to target
+        dtheta = angle_diff(self._scan_target_heading, th)
+        ang_tol = math.radians(3.0)
+
+        if abs(dtheta) > ang_tol:
+            # Turn towards target heading
+            self.command['motion'] = [0, self.turn_cmd if dtheta > 0 else -self.turn_cmd]
+            self.notification = 'Startup scan: rotating'
+        else:
+            # Reached this step heading — start pause and advance to next step
+            self.command['motion'] = [0, 0]
+            self._scan_steps_done += 1
+            self._scan_target_heading = None
+            self._scan_pause_until = now + self._scan_pause
+            self.notification = f'Startup scan: step {self._scan_steps_done}/{self._scan_total_steps}'
+
     # ============= Planning =============
     def replan(self, initial: bool = False):
         """Plan waypoints from current pose to remaining targets, avoiding known+discovered obstacles."""
@@ -246,7 +340,8 @@ class AutoOperateDynamic(Operate):
             new_waypoints = plan_waypoints(robot_xy, self.remaining_targets, obstacles_xy,
                                            grid_res=self.grid_res,
                                            robot_radius=self.robot_radius,
-                                           safety_margin=self.safety_margin)
+                                           safety_margin=self.safety_margin,
+                                           bounds_margin=0.25)
             self.waypoints = new_waypoints
             self.current_goal = None  # will pick first on next control step
             if initial:
@@ -254,7 +349,31 @@ class AutoOperateDynamic(Operate):
             else:
                 self.notification = f'Replanned path with {len(self.waypoints)} waypoints'
         except Exception as e:
-            self.notification = f'Planning failed: {e}'
+            # Fallback: relax safety margin and try once more
+            try:
+                relaxed_margin = max(0.05, self.safety_margin - 0.08)
+                new_waypoints = plan_waypoints(robot_xy, self.remaining_targets, obstacles_xy,
+                                               grid_res=self.grid_res,
+                                               robot_radius=self.robot_radius,
+                                               safety_margin=relaxed_margin,
+                                               bounds_margin=0.35)
+                self.waypoints = new_waypoints
+                self.current_goal = None
+                self.notification = f'Replanned with relaxed margin ({relaxed_margin:.2f}); {len(self.waypoints)} waypoints'
+            except Exception as e2:
+                # Last resort: enlarge bounds further and relax safety again
+                try:
+                    more_relaxed = max(0.03, relaxed_margin - 0.04)
+                    new_waypoints = plan_waypoints(robot_xy, self.remaining_targets, obstacles_xy,
+                                                   grid_res=self.grid_res,
+                                                   robot_radius=self.robot_radius,
+                                                   safety_margin=more_relaxed,
+                                                   bounds_margin=0.45)
+                    self.waypoints = new_waypoints
+                    self.current_goal = None
+                    self.notification = f'Replanned with enlarged bounds + margin ({more_relaxed:.2f}); {len(self.waypoints)} waypoints'
+                except Exception as e3:
+                    self.notification = f'Planning failed: {e3}'
 
     def _advance_target(self):
         if not self.remaining_targets:
@@ -280,6 +399,11 @@ class AutoOperateDynamic(Operate):
     # ============= Perception integration =============
     def periodic_perception_update(self):
         """Process detector outputs to add unknown obstacles, and replan if new obstacles observed."""
+        # Defer dynamic obstacle integration until after startup scan and sufficient markers
+        if self.startup_scan_enabled and not self._startup_scan_done:
+            return
+        if len(getattr(self.ekf, 'taglist', [])) < 2:
+            return
         bboxes = getattr(self, 'detector_output', None)
         if not isinstance(bboxes, (list, tuple)) or len(bboxes) == 0:
             return
@@ -437,12 +561,13 @@ if __name__ == "__main__":
     while running:
         operate.update_keyboard()
         operate.take_pic()
+        # Detect obstacles and replan BEFORE commanding motion for this cycle
+        operate.detect_target()  # populates operate.detector_output
+        operate.periodic_perception_update()  # add obstacles + replan if needed
         operate.auto_nav_step()
         drive_meas = operate.control()
         operate.update_slam(drive_meas)
         operate.record_data()
         operate.save_image()
-        operate.detect_target()  # populates operate.detector_output
-        operate.periodic_perception_update()  # add obstacles + replan if needed
         operate.draw(canvas)
         pygame.display.update()

@@ -140,9 +140,11 @@ def sparsify_path(world_pts, angle_eps_deg=5.0):
     return keep
 
 
-def plan_waypoints(robot_xy, targets_xy, obstacles_xy, grid_res=0.02, robot_radius=0.12, safety_margin=0.05):
+def plan_waypoints(robot_xy, targets_xy, obstacles_xy,
+                   grid_res=0.02, robot_radius=0.12, safety_margin=0.05,
+                   bounds_margin=0.25):
     all_pts = obstacles_xy + targets_xy + [robot_xy]
-    bounds = infer_bounds(all_pts, margin=0.25)
+    bounds = infer_bounds(all_pts, margin=bounds_margin)
     grid = build_occupancy(obstacles_xy, bounds, grid_res, robot_radius + safety_margin)
 
     waypoints = []
