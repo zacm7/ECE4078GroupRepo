@@ -1,9 +1,10 @@
-#!/usr/bin/env python3
+
 import os
 import sys
 import argparse
 import time
 import math
+import json
 from types import SimpleNamespace
 from typing import List, Tuple
 
@@ -31,6 +32,11 @@ except Exception:
 
 # Helpers and planner
 from map_utils import read_true_map_robust, load_search_list, print_target_fruits_pos
+try:
+    # Prefer direct import if Week05-06 is on sys.path (it is added above)
+    from TargetPoseEst import estimate_pose  # type: ignore
+except Exception:
+    estimate_pose = None  # will fallback to heuristic projection
 from astar_planning import plan_waypoints
 
 
@@ -91,6 +97,12 @@ class AutoOperateDynamic(Operate):
         self._creep_until = None
         self._planned_once = False
 
+        # Arrival reverse behavior
+        self.hold_duration = 2.5
+        self.reverse_duration = 0.75
+        self._reverse_until = None
+        self._pending_complete_after_reverse = False
+
         # Detection handling
         self.last_obstacle_add_time = 0.0
         self.add_cooldown = 0.5  # seconds
@@ -101,12 +113,30 @@ class AutoOperateDynamic(Operate):
         self.cx = float(self.K[0, 2]) if self.K is not None else 160.0
         self.fx = float(self.K[0, 0]) if self.K is not None else 320.0
 
-        # Post-hold backoff to avoid bumping the fruit when turning
-        self.backoff_active = False
-        self.backoff_start_time = 0.0
-        self.backoff_duration = 1  # seconds to reverse
-        self.backoff_speed = 0.6    # reverse speed (same scale as fwd_cmd)
-        self._advance_after_backoff = False
+    # --- Lightweight logging for post-run visualization ---
+        self._log = {
+            'meta': {
+                'search_list': list(self.search_list),
+                'targets_xy': [list(t) for t in targets_xy],
+                'aruco_obstacles_xy': [list(o) for o in aruco_obstacles_xy],
+                'grid_res': self.grid_res,
+                'robot_radius': self.robot_radius,
+                'safety_margin': self.safety_margin,
+            },
+            'poses': [],      # each: [t, x, y, th]
+            'plans': [],      # each: {t, waypoints: [[x,y], ...]}
+            'obstacles': []   # each: {t, x, y, label, method}
+        }
+        self._last_pose_log = 0.0
+        self._last_flush = 0.0
+        # logs go under Week07-08/lab_output regardless of cwd
+        week0708_dir = os.path.join(REPO_ROOT, 'Week07-08')
+        log_dir = os.path.join(week0708_dir, 'lab_output')
+        self._log_path = os.path.join(log_dir, 'auto_nav_log.json')
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except Exception:
+            pass
 
     # ============= Navigation primitives =============
     def get_pose(self) -> Tuple[float, float, float]:
@@ -127,6 +157,117 @@ class AutoOperateDynamic(Operate):
         self.reached_time = None
         self.notification = f'Navigating to: [{self.current_goal[0]:.2f}, {self.current_goal[1]:.2f}]'
 
+    # --- Live overlay on SLAM panel ---
+    def draw(self, canvas):
+        # Call base draw first to get standard panels
+        super().draw(canvas)
+
+        # Compute where SLAM surface was blitted in base draw
+        # Base uses: ekf_view at (2*h_pad + 320, v_pad) with res (320, 480+v_pad)
+        v_pad = 40
+        h_pad = 20
+        slam_origin = (2 * h_pad + 320, v_pad)
+        slam_res = (320, 480 + v_pad)
+
+        # We need a surface reference to draw onto; re-generate ekf view here to overlay
+        ekf_view = self.ekf.draw_slam_state(res=(320, 480 + v_pad), not_pause=self.ekf_on)
+
+        # Helper: convert world (relative to robot) to image coords used by ekf_view
+        def to_im(xy):
+            # replicate EKF.to_im_coor behavior with m2pixel=100
+            m2pixel = 100
+            w, h = (320, 480 + v_pad)
+            x, y = xy
+            x_im = int(-x * m2pixel + w / 2.0)
+            y_im = int(y * m2pixel + h / 2.0)
+            return (x_im, y_im)
+
+        # Get robot pose to shift world coords relative to robot
+        rx, ry, rth = self.get_pose()
+
+        # Draw planned waypoints to CURRENT target only (blue)
+        if self.waypoints and len(self.waypoints) >= 1 and self.remaining_targets:
+            current_target = self.remaining_targets[0]
+            tx, ty = float(current_target[0]), float(current_target[1])
+            stop_tol = max(0.12, self.grid_res * 3)
+
+            pts = []
+            pts.append(to_im((0.0, 0.0)))  # robot origin in EKF view
+            partial_pts = []
+            reached_segment = False
+            for wp in self.waypoints:
+                wx, wy = float(wp[0]), float(wp[1])
+                partial_pts.append((wx, wy))
+                # stop when a waypoint reaches vicinity of the current target
+                if math.hypot(wx - tx, wy - ty) <= stop_tol:
+                    reached_segment = True
+                    break
+
+            # If we didn't find a waypoint near the target, draw all we have
+            if not partial_pts:
+                partial_pts = []
+            # Append transformed points
+            for wx, wy in partial_pts:
+                pts.append(to_im((wx - rx, wy - ry)))
+
+            # Draw if we have at least a segment
+            if len(pts) >= 2:
+                for i in range(len(pts) - 1):
+                    pygame.draw.line(ekf_view, (40, 90, 220), pts[i], pts[i + 1], 2)
+                for p in pts[1:]:
+                    pygame.draw.circle(ekf_view, (40, 90, 220), p, 3)
+
+        # Draw known + discovered obstacles (red X)
+        all_obs = []
+        all_obs.extend(self.known_obstacles)
+        all_obs.extend(self.discovered_obstacles)
+        for ox, oy in all_obs:
+            px, py = to_im((float(ox) - rx, float(oy) - ry))
+            pygame.draw.line(ekf_view, (220, 50, 50), (px - 4, py - 4), (px + 4, py + 4), 2)
+            pygame.draw.line(ekf_view, (220, 50, 50), (px - 4, py + 4), (px + 4, py - 4), 2)
+
+        # Blit the augmented SLAM view back to the main canvas
+        canvas.blit(ekf_view, slam_origin)
+        return canvas
+
+    # --- Logging helpers ---
+    def _log_pose(self, now: float | None = None):
+        try:
+            t = time.time() if now is None else now
+            x, y, th = self.get_pose()
+            self._log['poses'].append([t, float(x), float(y), float(th)])
+        except Exception:
+            pass
+
+    def _log_plan(self):
+        try:
+            self._log['plans'].append({
+                't': time.time(),
+                'waypoints': [list(wp) for wp in (self.waypoints or [])]
+            })
+        except Exception:
+            pass
+
+    def _log_obstacle(self, x: float, y: float, label: str, method: str):
+        try:
+            self._log['obstacles'].append({
+                't': time.time(), 'x': float(x), 'y': float(y),
+                'label': str(label), 'method': str(method)
+            })
+        except Exception:
+            pass
+
+    def _flush_log(self, force: bool = False):
+        try:
+            now = time.time()
+            if not force and (now - self._last_flush) < 2.0:
+                return
+            with open(self._log_path, 'w') as f:
+                json.dump(self._log, f, indent=2)
+            self._last_flush = now
+        except Exception:
+            pass
+
     def auto_nav_step(self):
         # Require SLAM
         if not self.ekf_on:
@@ -134,44 +275,21 @@ class AutoOperateDynamic(Operate):
             self.notification = 'Press ENTER to start SLAM'
             return
 
-        # Handle post-hold backoff
-        if getattr(self, 'backoff_active', False):
-            now = time.time()
-            if now - self.backoff_start_time < self.backoff_duration:
-                self.command['motion'] = [-self.backoff_speed, 0]
-                self.notification = 'Backing off from target'
-                return
-            # Backoff complete -> stop and advance
-            self.backoff_active = False
-            self.command['motion'] = [0, 0]
-            if self._advance_after_backoff:
-                self._advance_after_backoff = False
-                self._advance_target()
-                self.replan(initial=False)
-                self.pick_next_goal()
-            return
-
         # Marker acquisition gate: scan and occasional creep until >=2 tags visible
         tag_count = len(getattr(self.ekf, 'taglist', []))
         now = time.time()
+
+        # Log pose at ~5 Hz and flush log periodically
+        if (now - self._last_pose_log) >= 0.2:
+            self._log_pose(now)
+            self._last_pose_log = now
+        self._flush_log(force=False)
         if tag_count < 2:
             if self._scan_start is None:
                 self._scan_start = now
                 self._scan_dir = 1
-                self._creep_until = None
-            # Creep interval active
-            if self._creep_until and now < self._creep_until:
-                self.command['motion'] = [self.fwd_cmd, 0]
-                self.notification = 'Looking for markers: creeping forward'
-                return
-            # After 6s of scanning, creep forward for 1s
+            # Rotate only (no creeping forward)
             elapsed = now - self._scan_start
-            if elapsed > 6.0:
-                self._creep_until = now + 1.0
-                self._scan_start = now
-                self.command['motion'] = [self.fwd_cmd, 0]
-                self.notification = 'Looking for markers: creeping forward'
-                return
             # Alternate scan direction every ~2s
             self._scan_dir = 1 if int(elapsed // 2) % 2 == 0 else -1
             self.command['motion'] = [0, self._scan_dir * self.turn_cmd]
@@ -181,6 +299,25 @@ class AutoOperateDynamic(Operate):
             # Reset scanning state when we have enough tags
             self._scan_start = None
             self._creep_until = None
+
+        # If finishing a reverse segment after target, finalize completion
+        now = time.time()
+        if self._reverse_until is not None:
+            if now < self._reverse_until:
+                # Continue reversing
+                self.command['motion'] = [-self.fwd_cmd, 0]
+                self.notification = 'Reversing from target'
+                return
+            else:
+                # Reverse finished
+                self._reverse_until = None
+                if self._pending_complete_after_reverse:
+                    self._pending_complete_after_reverse = False
+                    # Target considered completed -> advance and replan
+                    self._advance_target()
+                    self.replan(initial=False)
+                    self.pick_next_goal()
+                    # Fall through to regular control after completion
 
         # Ensure we have a plan from current pose to remaining targets
         if (not self._planned_once and self.active) or (self.active and not self.waypoints):
@@ -209,13 +346,12 @@ class AutoOperateDynamic(Operate):
                     self.reached_time = time.time()
                     self.notification = f'Reached target [{gx:.2f}, {gy:.2f}]. Holding...'
                 self.command['motion'] = [0, 0]
-                if time.time() - self.reached_time >= 2.0:
-                    # Start a brief reverse before advancing to the next target
-                    self.backoff_active = True
-                    self.backoff_start_time = time.time()
-                    self._advance_after_backoff = True
-                    self.notification = f'Backing off from [{gx:.2f}, {gy:.2f}] before next target'
-                    self.command['motion'] = [-self.backoff_speed, 0]
+                # After holding, perform a brief reverse before completing
+                if time.time() - self.reached_time >= self.hold_duration:
+                    self._reverse_until = time.time() + self.reverse_duration
+                    self._pending_complete_after_reverse = True
+                    self.command['motion'] = [-self.fwd_cmd, 0]
+                    self.notification = 'Reversing from target'
                 return
             else:
                 self.pick_next_goal()
@@ -253,6 +389,9 @@ class AutoOperateDynamic(Operate):
                 self.notification = f'Planned {len(self.waypoints)} waypoints via A* (initial)'
             else:
                 self.notification = f'Replanned path with {len(self.waypoints)} waypoints'
+            # Log the new plan
+            self._log_plan()
+            self._flush_log(force=False)
         except Exception as e:
             self.notification = f'Planning failed: {e}'
 
@@ -265,6 +404,14 @@ class AutoOperateDynamic(Operate):
             self.remaining_labels.pop(0)
         # Reset timing state when target advances
         self.reached_time = None
+        # Ensure the next current target is not blocked by a previously added obstacle
+        if self.remaining_targets:
+            ntx, nty = self.remaining_targets[0]
+            # prune discovered obstacles that overlap the new current target location
+            self.discovered_obstacles = [
+                [ox, oy] for (ox, oy) in self.discovered_obstacles
+                if math.hypot(ox - ntx, oy - nty) > max(0.12, self.grid_res * 2)
+            ]
         if not self.remaining_targets:
             self.waypoints = []
             self.current_goal = None
@@ -290,11 +437,10 @@ class AutoOperateDynamic(Operate):
         x, y, th = self.get_pose()
         cx, fx = self.cx, self.fx
 
-        # Copy remaining targets to avoid blocking them as obstacles where appropriate
-        # Note: we will only *ignore* detections that correspond to the current target (index 0).
+        # Keep a copy of remaining targets; current target is index 0 (if exists)
         known_targets = self.remaining_targets[:]
 
-        # tolerance for matching detection to the current target (meters)
+        # tolerance for matching detection to a remaining target (meters)
         target_match_tol = 0.30
 
         for det in bboxes:
@@ -307,46 +453,49 @@ class AutoOperateDynamic(Operate):
             if conf < 0.4:
                 continue
 
-            # Project detection center to a rough world point
-            u = float(xywh[0])
-            w_px = float(xywh[2])
-            alpha = math.atan((u - cx) / fx)
-            bearing = th + alpha
-            W_assumed = 0.10
-            if w_px <= 1.0:
-                d = 0.5
-            else:
-                d = max(0.35, min(1.10, (fx * W_assumed) / w_px))
-            ox = x + d * math.cos(bearing)
-            oy = y + d * math.sin(bearing)
+            # Project detection to a world point using TargetPoseEst if available; otherwise fallback to heuristic
+            ox, oy = None, None
+            used_tpe = False
+            try:
+                if estimate_pose is not None and self.K is not None:
+                    # TargetPoseEst expects obj_info as [label, [x,y,w,h]] and robot_pose as [x,y,theta]
+                    obj_info = [label, [float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])]]
+                    pose_dict = estimate_pose(self.K, obj_info, [x, y, th])  # type: ignore[arg-type]
+                    if pose_dict and 'x' in pose_dict and 'y' in pose_dict:
+                        ox = float(pose_dict['x'])
+                        oy = float(pose_dict['y'])
+                        used_tpe = True
+            except Exception:
+                # Fallback below
+                pass
 
-            # ===== NEW BEHAVIOR: only ignore detection if it corresponds to the CURRENT target =====
-            if label in self.search_list:
-                # Is there a current target?
-                if len(self.remaining_targets) > 0 and len(self.remaining_labels) > 0:
-                    current_label = str(self.remaining_labels[0]).lower()
-                    if label == current_label:
-                        # If the detection is close enough to the known current-target position,
-                        # it's likely the same target — ignore it as obstacle.
-                        tx, ty = self.remaining_targets[0]
-                        if math.hypot(ox - tx, oy - ty) <= target_match_tol:
-                            # This detection corresponds to current target -> ignore as obstacle
-                            continue
-                        # else: detection of same label but not near current target -> treat as obstacle
-                    else:
-                        # detection is a shopping-list class but NOT the current target -> treat as obstacle
-                        pass
+            if ox is None or oy is None:
+                # Fallback rough projection (bearing from u, depth from box width)
+                u = float(xywh[0])
+                w_px = float(xywh[2])
+                alpha = math.atan((u - cx) / max(1e-6, fx))
+                bearing = th + alpha
+                W_assumed = 0.10
+                if w_px <= 1.0:
+                    d = 0.5
                 else:
-                    # no reliable remaining_targets/labels -> conservatively treat detected shopping-list
-                    # classes as obstacles (safe fallback)
-                    pass
+                    d = max(0.35, min(1.10, (fx * W_assumed) / w_px))
+                ox = x + d * math.cos(bearing)
+                oy = y + d * math.sin(bearing)
 
-            # If close to a known target (other than the special-case above), ignore to avoid false positives
-            # (But note: we intentionally let non-current shopping-list detections get treated as obstacles.
-            #  This check prevents marking an obstacle if it's *very* close to a known target centre.)
-            if any(math.hypot(ox - tx, oy - ty) <= 0.10 for tx, ty in known_targets):
-                # Very close to a known target centre -> skip adding (avoids tiny projection noise)
-                continue
+            # Ignore detections that correspond to the CURRENT target only
+            if self.remaining_targets and self.remaining_labels:
+                current_label = str(self.remaining_labels[0]).lower()
+                tx0, ty0 = self.remaining_targets[0]
+                if label == current_label and math.hypot(ox - tx0, oy - ty0) <= target_match_tol:
+                    # This is likely the current target; don't add as obstacle
+                    continue
+
+            # Avoid false positives extremely close to CURRENT target centre only
+            if self.remaining_targets:
+                tx0, ty0 = self.remaining_targets[0]
+                if math.hypot(ox - tx0, oy - ty0) <= 0.10:
+                    continue
 
             # Ignore duplicates amongst known and discovered obstacles
             all_obs = self.known_obstacles + self.discovered_obstacles
@@ -359,6 +508,8 @@ class AutoOperateDynamic(Operate):
 
             # Add obstacle and mark for replanning
             self.discovered_obstacles.append([ox, oy])
+            self._log_obstacle(ox, oy, label=label, method=('tpe' if used_tpe else 'heuristic'))
+            self._flush_log(force=False)
             self.last_obstacle_add_time = now
             new_added = True
 

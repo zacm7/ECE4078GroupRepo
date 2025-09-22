@@ -30,8 +30,9 @@ def read_true_map_robust(map_path: str):
     aruco_true_pos = np.empty((10, 2), dtype=float)
 
     for key, v in gt.items():
-        x = float(np.round(v['x'], 1))
-        y = float(np.round(v['y'], 1))
+        # Use full precision from the map (no rounding)
+        x = float(v['x'])
+        y = float(v['y'])
         if key.startswith('aruco'):
             # aruco10_* -> index 9
             if key.startswith('aruco10'):
@@ -59,7 +60,7 @@ def print_target_fruits_pos(search_list, fruit_list, fruit_true_pos):
     for fruit in search_list:
         for i in range(len(fruit_list)):
             if fruit == fruit_list[i]:
-                print(f"{n_fruit}) {fruit} at [{np.round(fruit_true_pos[i][0], 1)}, {np.round(fruit_true_pos[i][1], 1)}]")
+                print(f"{n_fruit}) {fruit} at [{fruit_true_pos[i][0]}, {fruit_true_pos[i][1]}]")
         n_fruit += 1
 
 
