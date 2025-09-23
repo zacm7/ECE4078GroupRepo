@@ -227,6 +227,13 @@ if __name__ == "__main__":
         pass
 
     operate = AutoOperatePlan(op_args, waypoints, fruit_indices)
+    # Lock EKF landmarks to fixed known ArUco positions from the full map
+    try:
+        if hasattr(operate, 'ekf') and operate.ekf is not None:
+            operate.ekf.fixed_aruco_pos = np.array(aruco_pos, dtype=float)
+            operate.ekf.lock_aruco = True
+    except Exception:
+        pass
 
     running = True
     while running:

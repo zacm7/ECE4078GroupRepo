@@ -79,6 +79,17 @@ class AutoOperateDynamic(Operate):
         # each item: {'x': float, 'y': float, 'label': str, 'count': int}
         self.discovered_obstacles: List[dict] = []
 
+        # Lock EKF landmarks to fixed ArUco positions from the partial map
+        try:
+            if hasattr(self, 'ekf') and self.ekf is not None:
+                # Ensure a (10,2) float array if possible
+                ap = np.array(self.known_obstacles, dtype=float)
+                if ap.ndim == 2 and ap.shape[1] == 2:
+                    self.ekf.fixed_aruco_pos = ap
+                    self.ekf.lock_aruco = True
+        except Exception:
+            pass
+
         # Map fruit ground truth (labels and positions) to suppress obstacle adds near known fruits
         self.map_fruit_labels: List[str] = [str(s).lower() for s in (map_fruit_labels or [])]
         self.map_fruit_xy: List[List[float]] = [list(p) for p in (map_fruit_xy or [])]
