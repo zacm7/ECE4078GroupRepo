@@ -147,6 +147,17 @@ class AutoOperateDynamic(Operate):
         self.calib_rotate_speed = 0.6    # angular speed used while scanning (tunable)
         self.calib_timeout = 6.0         # seconds to give up if no aruco seen
 
+        # Periodic spin behaviour (replaces any ongoing scanning except initial tag-acquisition)
+        # Spin for 6 seconds every 3 seconds at 0.5 turn speed.
+        # Note: with duration > period, this results in 3s gap then 6s spin, repeating.
+        self.enable_calib_scan = False   # disable periodic ArUco calibration scan in favour of timed spins
+        self.spin_period = 3.0           # seconds between spin starts
+        self.spin_duration = 6.0         # seconds spinning once started
+        self.spin_speed = 0.5            # turn command while spinning
+        self._spin_active = False
+        self._spin_start = None
+        self._next_spin_time = time.time() + self.spin_period
+
     # --- Lightweight logging for post-run visualization ---
         self._log = {
             'meta': {
@@ -298,15 +309,24 @@ class AutoOperateDynamic(Operate):
 
         # --- Calibration / scan status overlay on ekf_view ---
         try:
-            if self._calib_mode:
-                status_msg = "CALIBRATION SCAN: scanning for ArUco..."
+            status_msg = None
+            if getattr(self, 'enable_calib_scan', False):
+                if self._calib_mode:
+                    status_msg = "CALIBRATION SCAN: scanning for ArUco..."
+                else:
+                    seconds_left = max(0, int(self.calib_interval - (time.time() - self.last_calib_time)))
+                    status_msg = f"Next calib in: {seconds_left}s"
             else:
-                # show seconds until next calibration scan
-                seconds_left = max(0, int(self.calib_interval - (time.time() - self.last_calib_time)))
-                status_msg = f"Next calib in: {seconds_left}s"
-            if self.label_font is not None:
+                # Show periodic spin status
+                now_dbg = time.time()
+                if self._spin_active and self._spin_start is not None:
+                    elapsed = now_dbg - float(self._spin_start)
+                    status_msg = f"Spin active: {elapsed:.1f}/{self.spin_duration:.1f}s"
+                else:
+                    seconds_left = max(0, int(self._next_spin_time - now_dbg))
+                    status_msg = f"Next spin in: {seconds_left}s"
+            if status_msg and self.label_font is not None:
                 status_surf = self.label_font.render(status_msg, True, (255, 200, 0))
-                # place at top-left of ekf_view with small padding
                 ekf_view.blit(status_surf, (6, 6))
         except Exception:
             pass
@@ -446,18 +466,16 @@ class AutoOperateDynamic(Operate):
             self.notification = 'Press ENTER to start SLAM'
             return
 
-        # Periodic calibration trigger (non-blocking start)
-        try:
-            if (time.time() - self.last_calib_time) >= self.calib_interval and not self._calib_mode:
-                # Start an in-place rotation and scan; do not change path/waypoints
-                self.start_calib_scan()
-        except Exception:
-            pass
-
-        # If currently in calibration mode, do calib step and return (do not replan or move along path)
-        if self._calib_mode:
-            self._perform_calib_scan_step()
-            return
+        # Periodic calibration trigger disabled (replaced by timed spins)
+        if getattr(self, 'enable_calib_scan', False):
+            try:
+                if (time.time() - self.last_calib_time) >= self.calib_interval and not self._calib_mode:
+                    self.start_calib_scan()
+            except Exception:
+                pass
+            if self._calib_mode:
+                self._perform_calib_scan_step()
+                return
 
         # Marker acquisition gate: scan and occasional creep until >=2 tags visible
         tag_count = len(getattr(self.ekf, 'taglist', []))
@@ -502,6 +520,32 @@ class AutoOperateDynamic(Operate):
                     self.replan(initial=False)
                     self.pick_next_goal()
                     # Fall through to regular control after completion
+
+        # Timed periodic spin behaviour (6s spin every 3s at 0.5 speed)
+        try:
+            now = time.time()
+            if not getattr(self, 'enable_calib_scan', False):
+                if self._spin_active:
+                    # Continue spinning until duration elapsed
+                    if (self._spin_start is not None) and (now - float(self._spin_start) < self.spin_duration):
+                        self.command['motion'] = [0, float(self.spin_speed)]
+                        self.notification = 'Periodic spin (observation sweep)'
+                        return
+                    else:
+                        # Spin finished; schedule next
+                        self._spin_active = False
+                        self._spin_start = None
+                        self._next_spin_time = now + self.spin_period
+                else:
+                    # Start a new spin if it's time
+                    if now >= float(self._next_spin_time):
+                        self._spin_active = True
+                        self._spin_start = now
+                        self.command['motion'] = [0, float(self.spin_speed)]
+                        self.notification = 'Starting periodic spin (6s)'
+                        return
+        except Exception:
+            pass
 
         # Ensure we have a plan from current pose to remaining targets
         if (not self._planned_once and self.active) or (self.active and not self.waypoints):

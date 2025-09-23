@@ -25,8 +25,10 @@ class PenguinPi:
             r_vel = command[0]*tick + command[1]*turning_tick
         # running on physical robot (if right wheel spins backwards in test motor)
         else:
+            # On physical robot the right wheel direction is reversed for the linear component.
+            # Keep differential mixing correct for turning so pure angular commands rotate in place.
             l_vel = command[0]*tick - command[1]*turning_tick
-            r_vel = -command[0]*tick - command[1]*turning_tick # reverse right wheel velocity
+            r_vel = -command[0]*tick - command[1]*turning_tick  # invert only the linear term for right wheel
         self.wheel_vel = [l_vel, r_vel]
         if time == 0:
             requests.get(

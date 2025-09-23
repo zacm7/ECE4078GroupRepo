@@ -301,6 +301,58 @@ def sparsify_path(world_pts, angle_eps_deg=5.0):
     return keep
 
 
+def _seg_point_min_dist(ax, ay, bx, by, px, py):
+    """Minimum distance from point P to segment AB."""
+    vx, vy = bx - ax, by - ay
+    wx, wy = px - ax, py - ay
+    vv = vx * vx + vy * vy
+    if vv <= 1e-12:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, (wx * vx + wy * vy) / vv))
+    cx, cy = ax + t * vx, ay + t * vy
+    return math.hypot(px - cx, py - cy)
+
+
+def sparsify_path_collision_aware(world_pts, obstacles_xy, clearance_radius, angle_eps_deg=5.0):
+    """Greedy sparsification that never creates a segment violating obstacle clearance.
+
+    - Starts with first point and tries to connect directly to farther points.
+    - If the direct segment from last kept point to candidate j is clear, keep extending.
+    - Otherwise, keep j-1 and continue.
+    - Also optionally prunes near-collinear points via angle threshold when safe.
+    """
+    if len(world_pts) <= 2:
+        return world_pts
+
+    # First, do a light pruning for near-collinear segments to reduce noise
+    prelim = sparsify_path(world_pts, angle_eps_deg=angle_eps_deg)
+    if len(prelim) <= 2:
+        return prelim
+
+    kept = [prelim[0]]
+    i = 0
+    while i < len(prelim) - 1:
+        # Try to skip as far as possible while keeping clearance
+        j = i + 1
+        best_j = j
+        while j < len(prelim):
+            ax, ay = kept[-1]
+            bx, by = prelim[j]
+            # Check segment clearance against all obstacles
+            clear = True
+            for (ox, oy) in obstacles_xy:
+                if _seg_point_min_dist(ax, ay, bx, by, float(ox), float(oy)) < clearance_radius:
+                    clear = False
+                    break
+            if clear:
+                best_j = j
+                j += 1
+            else:
+                break
+        kept.append(prelim[best_j])
+        i = best_j
+    return kept
+
 def _upsample_segment(segment_pts, max_step=0.03):
     """Linearly upsample a short final segment so robot approaches smoothly.
     Inserts intermediate points if consecutive points are farther than max_step.
@@ -340,8 +392,9 @@ def plan_waypoints(robot_xy, targets_xy, obstacles_xy, grid_res=0.02, robot_radi
             raise RuntimeError(f"No path found from {cur_xy} to {tgt}")
         world_path = [list(grid_to_world(ix, iy, bounds, grid_res)) for (ix, iy) in path]
 
-        # Sparsify to remove near-collinear points
-        sparse = sparsify_path(world_path, angle_eps_deg=5.0)
+        # Sparsify path but ensure segments maintain clearance from obstacles
+        clearance = float(robot_radius + safety_margin)
+        sparse = sparsify_path_collision_aware(world_path, obstacles_xy, clearance, angle_eps_deg=5.0)
 
         # Ensure last point is exactly the true target coordinates (avoid grid center quantization)
         if len(sparse) >= 1:
