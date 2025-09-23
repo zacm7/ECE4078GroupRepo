@@ -1,4 +1,4 @@
-
+# Standard library imports
 import os
 import sys
 import argparse
@@ -8,10 +8,12 @@ import json
 from types import SimpleNamespace
 from typing import List, Tuple
 
+# Third-party libraries
 import numpy as np
 import pygame
 
 
+# Useful path anchors
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 WEEK0506_DIR = os.path.join(REPO_ROOT, "Week05-06")
@@ -19,9 +21,11 @@ WEEK0506_DIR = os.path.join(REPO_ROOT, "Week05-06")
 # Import Week05-06 operate.py (GUI + EKF + detector)
 sys.path.insert(0, WEEK0506_DIR)
 try:
+    # Prefer normal import when available
     import operate as operate_mod  # type: ignore
     from operate import Operate    # type: ignore
 except Exception:
+    # Fallback: load operate.py by file path if import fails
     import importlib.util
     _op_file = os.path.join(WEEK0506_DIR, "operate.py")
     _spec = importlib.util.spec_from_file_location("operate", _op_file)
@@ -36,15 +40,18 @@ try:
     # Prefer direct import if Week05-06 is on sys.path (it is added above)
     from TargetPoseEst import estimate_pose  # type: ignore
 except Exception:
+    # If TargetPoseEst isn't available, we'll use a heuristic projection later
     estimate_pose = None  # will fallback to heuristic projection
 from astar_planning import plan_waypoints
 
 
 def normalize_angle(a: float) -> float:
+    # Wrap angles to [-pi, pi)
     return (a + math.pi) % (2 * math.pi) - math.pi
 
 
 def angle_diff(a: float, b: float) -> float:
+    # Smallest signed difference from angle b to a
     return normalize_angle(a - b)
 
 
@@ -59,7 +66,7 @@ class AutoOperateDynamic(Operate):
 
     def __init__(self, args, search_list: List[str], targets_xy: List[List[float]],
                  aruco_obstacles_xy: List[List[float]], grid_res: float,
-                 robot_radius: float, safety_margin: float, merge_threshold: float = 0.50,
+                 robot_radius: float, safety_margin: float, merge_threshold: float = 1.0,
                  map_fruit_labels: List[str] | None = None,
                  map_fruit_xy: List[List[float]] | None = None):
         super().__init__(args)
@@ -67,30 +74,31 @@ class AutoOperateDynamic(Operate):
         # Always run detector continuously
         self.command['inference'] = True
 
-        # Planning model
+        # Planning model: target queue and known obstacles (from map)
         self.search_list = [s.lower() for s in search_list]
         # remaining_targets holds world positions of targets in order
         self.remaining_targets: List[List[float]] = [list(t) for t in targets_xy]
         # remaining_labels keeps the same order but stores the class label for each target
         self.remaining_labels: List[str] = [s.lower() for s in search_list]
 
+        # Start with ArUco markers as known obstacles; new ones will be discovered at runtime
         self.known_obstacles: List[List[float]] = [list(o) for o in aruco_obstacles_xy]
         self.discovered_obstacles: List[List[float]] = []
         # Keep parallel metadata for discovered obstacles
         self.discovered_labels: List[str] = []
         self.discovered_counts: List[int] = []
-        # Map fruit ground truth (labels and positions) to suppress obstacle adds near known fruits
+        # Map fruit ground truth (labels and positions) to suppress adding known fruits as obstacles
         self.map_fruit_labels: List[str] = [str(s).lower() for s in (map_fruit_labels or [])]
         self.map_fruit_xy: List[List[float]] = [list(p) for p in (map_fruit_xy or [])]
         # Consider detection as known fruit if within this distance of a mapped fruit of same label
         self.map_match_tol = 0.35
 
-        # A* params
+        # A* params: grid resolution and obstacle inflation (robot size + buffer)
         self.grid_res = grid_res
         self.robot_radius = robot_radius
         self.safety_margin = safety_margin
 
-        # Controller params (mirror Level 2)
+        # Controller params (mirror Level 2): waypoint tracking tolerances and speeds
         self.waypoints: List[List[float]] = []
         self.current_goal: List[float] | None = None
         self.reached_time: float | None = None
@@ -101,29 +109,26 @@ class AutoOperateDynamic(Operate):
         self.turn_cmd = 1
         self.fwd_cmd = 1
 
-        # Marker acquisition (scan/creep) state
+        # Marker acquisition (scan/creep) state: rotate-in-place scanning until enough tags are visible
         self._scan_start = None
         self._scan_dir = 1
         self._creep_until = None
         self._planned_once = False
 
-        # Arrival reverse behavior
+        # Arrival reverse behavior: after holding at a target, back up slightly before continuing
         self.hold_duration = 2.5
         self.reverse_duration = 0.75
         self._reverse_until = None
         self._pending_complete_after_reverse = False
 
-        # Detection handling
+        # Detection handling: de-dup windows, merge radius, and throttling
         self.last_obstacle_add_time = 0.0
         self.add_cooldown = 0.5  # seconds
         self.min_obs_separation = 0.15  # m
         # Merge detections of the same obstacle label within this radius (m)
         self.merge_threshold = float(merge_threshold)
-        # Arena virtual walls (2.4x2.4m centered at origin) with 10cm keep-out
-        self.arena_half = 1.20
-        self.wall_clearance = 0.10
 
-        # Cache intrinsics (for projection of bbox -> world)
+        # Cache camera intrinsics (for projecting bbox -> world via TargetPoseEst)
         self.K = getattr(self.ekf.robot, 'camera_matrix', None)
         self.cx = float(self.K[0, 2]) if self.K is not None else 160.0
         self.fx = float(self.K[0, 0]) if self.K is not None else 320.0
@@ -156,6 +161,7 @@ class AutoOperateDynamic(Operate):
 
     # ============= Navigation primitives =============
     def get_pose(self) -> Tuple[float, float, float]:
+        # Read robot pose [x, y, theta] from EKF state; default to zeros if unavailable
         if hasattr(self, "ekf") and self.ekf is not None:
             robot = getattr(self.ekf, "robot", None)
             if robot is not None and hasattr(robot, "state") and robot.state.shape[0] >= 3:
@@ -166,6 +172,7 @@ class AutoOperateDynamic(Operate):
         return 0.0, 0.0, 0.0
 
     def pick_next_goal(self):
+        # Pop the next waypoint into current_goal and update UI
         if not self.waypoints:
             self.current_goal = None
             return
@@ -242,31 +249,13 @@ class AutoOperateDynamic(Operate):
             pygame.draw.line(ekf_view, (220, 50, 50), (px - 4, py - 4), (px + 4, py + 4), 2)
             pygame.draw.line(ekf_view, (220, 50, 50), (px - 4, py + 4), (px + 4, py - 4), 2)
 
-        # Draw virtual wall boundary (inner rectangle), if configured
-        try:
-            inner = max(0.0, float(self.arena_half) - float(self.wall_clearance))
-        except Exception:
-            inner = 0.0
-        if inner > 0.0:
-            # Define rectangle corners in world frame, then transform relative to robot pose
-            rect_world = [
-                (-inner, -inner),
-                ( inner, -inner),
-                ( inner,  inner),
-                (-inner,  inner),
-            ]
-            rect_pts = [to_im((wx - rx, wy - ry)) for (wx, wy) in rect_world]
-            # Close the loop by appending first point at end
-            rect_pts.append(rect_pts[0])
-            for i in range(len(rect_pts) - 1):
-                pygame.draw.line(ekf_view, (120, 180, 120), rect_pts[i], rect_pts[i + 1], 2)
-
         # Blit the augmented SLAM view back to the main canvas
         canvas.blit(ekf_view, slam_origin)
         return canvas
 
     # --- Logging helpers ---
     def _log_pose(self, now: float | None = None):
+        # Append current pose to the run log (time, x, y, theta)
         try:
             t = time.time() if now is None else now
             x, y, th = self.get_pose()
@@ -275,6 +264,7 @@ class AutoOperateDynamic(Operate):
             pass
 
     def _log_plan(self):
+        # Append current plan (list of waypoints) to the run log
         try:
             self._log['plans'].append({
                 't': time.time(),
@@ -284,6 +274,7 @@ class AutoOperateDynamic(Operate):
             pass
 
     def _log_obstacle(self, x: float, y: float, label: str, method: str):
+        # Record an obstacle add/merge event with its origin (tpe or heuristic)
         try:
             self._log['obstacles'].append({
                 't': time.time(), 'x': float(x), 'y': float(y),
@@ -293,6 +284,7 @@ class AutoOperateDynamic(Operate):
             pass
 
     def _flush_log(self, force: bool = False):
+        # Periodically write the log to disk to avoid data loss
         try:
             now = time.time()
             if not force and (now - self._last_flush) < 2.0:
@@ -304,6 +296,7 @@ class AutoOperateDynamic(Operate):
             pass
 
     def auto_nav_step(self):
+        # One step of the autonomous navigation state machine
         # Require SLAM
         if not self.ekf_on:
             self.command['motion'] = [0, 0]
@@ -413,19 +406,8 @@ class AutoOperateDynamic(Operate):
         x, y, _ = self.get_pose()
         robot_xy = [x, y]
         obstacles_xy = list(self.known_obstacles) + list(self.discovered_obstacles)
-        # Add virtual wall obstacles along the inner boundary at ±(arena_half - wall_clearance)
-        inner = max(0.0, float(self.arena_half) - float(self.wall_clearance))
-        if inner > 0.0:
-            step = max(0.02, min(0.10, self.grid_res))
-            xs = np.arange(-inner, inner + step, step)
-            ys = np.arange(-inner, inner + step, step)
-            for xv in xs:
-                obstacles_xy.append([float(xv), float(inner)])
-                obstacles_xy.append([float(xv), float(-inner)])
-            for yv in ys:
-                obstacles_xy.append([float(inner), float(yv)])
-                obstacles_xy.append([float(-inner), float(yv)])
         try:
+            # A* planner: compute global waypoints that avoid inflated obstacles
             new_waypoints = plan_waypoints(robot_xy, self.remaining_targets, obstacles_xy,
                                            grid_res=self.grid_res,
                                            robot_radius=self.robot_radius,
@@ -443,6 +425,7 @@ class AutoOperateDynamic(Operate):
             self.notification = f'Planning failed: {e}'
 
     def _advance_target(self):
+        # Mark current target as completed and prepare next one
         if not self.remaining_targets:
             return
         # Remove the front target as completed
@@ -476,6 +459,7 @@ class AutoOperateDynamic(Operate):
             self.notification = 'All targets completed'
 
     def _is_close_to_current_target(self, goal_xy: List[float]) -> bool:
+        # Helper: is a waypoint close enough to the current target to trigger hold behavior
         if not self.remaining_targets:
             return False
         tx, ty = self.remaining_targets[0]
@@ -621,6 +605,7 @@ class AutoOperateDynamic(Operate):
 
 
 if __name__ == "__main__":
+    # CLI to configure sources, map/list files, and planning params
     parser = argparse.ArgumentParser("Level 3: Partial-map A* with online obstacle discovery + GUI/SLAM")
     parser.add_argument("--ip", type=str, default="192.168.50.1")
     parser.add_argument("--port", type=int, default=8080)
@@ -630,7 +615,7 @@ if __name__ == "__main__":
     parser.add_argument("--list", type=str, default=os.path.join(SCRIPT_DIR, "M3_prac_shopping_list.txt"))
     parser.add_argument("--grid_res", type=float, default=0.02)
     parser.add_argument("--robot_radius", type=float, default=0.12)
-    parser.add_argument("--safety_margin", type=float, default=0.15)
+    parser.add_argument("--safety_margin", type=float, default=0.08)
     parser.add_argument("--merge_threshold", type=float, default=0.30)
     parser.add_argument("--play_data", action='store_true')
     parser.add_argument("--save_data", action='store_true')
@@ -693,6 +678,7 @@ if __name__ == "__main__":
 
     running = True
     while running:
+        # Main control loop: sense -> plan/act -> update SLAM -> draw
         operate.update_keyboard()
         operate.take_pic()
         operate.auto_nav_step()
