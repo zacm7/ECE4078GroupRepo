@@ -1,5 +1,5 @@
-capsicum
 garlic
+pear
 tomato
 potato
 orange

@@ -1,4 +1,3 @@
-
 import os
 import sys
 import argparse
@@ -60,6 +59,7 @@ class AutoOperateDynamic(Operate):
     def __init__(self, args, search_list: List[str], targets_xy: List[List[float]],
                  aruco_obstacles_xy: List[List[float]], grid_res: float,
                  robot_radius: float, safety_margin: float, merge_threshold: float = 0.50,
+                 obs_max_range: float = 0.45,
                  map_fruit_labels: List[str] | None = None,
                  map_fruit_xy: List[List[float]] | None = None):
         super().__init__(args)
@@ -75,10 +75,10 @@ class AutoOperateDynamic(Operate):
         self.remaining_labels: List[str] = [s.lower() for s in search_list]
 
         self.known_obstacles: List[List[float]] = [list(o) for o in aruco_obstacles_xy]
-        self.discovered_obstacles: List[List[float]] = []
-        # Keep parallel metadata for discovered obstacles
-        self.discovered_labels: List[str] = []
-        self.discovered_counts: List[int] = []
+        # discovered obstacles stored as dicts for safety/alignment
+        # each item: {'x': float, 'y': float, 'label': str, 'count': int}
+        self.discovered_obstacles: List[dict] = []
+
         # Map fruit ground truth (labels and positions) to suppress obstacle adds near known fruits
         self.map_fruit_labels: List[str] = [str(s).lower() for s in (map_fruit_labels or [])]
         self.map_fruit_xy: List[List[float]] = [list(p) for p in (map_fruit_xy or [])]
@@ -109,7 +109,7 @@ class AutoOperateDynamic(Operate):
 
         # Arrival reverse behavior
         self.hold_duration = 2.5
-        self.reverse_duration = 0.75
+        self.reverse_duration = 0.5
         self._reverse_until = None
         self._pending_complete_after_reverse = False
 
@@ -119,6 +119,8 @@ class AutoOperateDynamic(Operate):
         self.min_obs_separation = 0.15  # m
         # Merge detections of the same obstacle label within this radius (m)
         self.merge_threshold = float(merge_threshold)
+        # Only consider detections as obstacles if within this distance (m) from the robot
+        self.obs_max_range = float(obs_max_range)
         # Arena virtual walls (2.4x2.4m centered at origin) with 10cm keep-out
         self.arena_half = 1.20
         self.wall_clearance = 0.10
@@ -127,6 +129,23 @@ class AutoOperateDynamic(Operate):
         self.K = getattr(self.ekf.robot, 'camera_matrix', None)
         self.cx = float(self.K[0, 2]) if self.K is not None else 160.0
         self.fx = float(self.K[0, 0]) if self.K is not None else 320.0
+
+        # Small font used for overlay labels (smaller text)
+        # pygame.font.init() is called in __main__ before the operate instance is created,
+        # so SysFont is available here.
+        try:
+            self.label_font = pygame.font.SysFont(None, 14)
+        except Exception:
+            self.label_font = None
+
+        # Calibration (ArUco) periodic scan params
+        self.calib_interval =10.0        # seconds between calibration scans (set to 20s)
+        self.last_calib_time = time.time()
+        self._calib_mode = False         # when True, robot is rotating to look for aruco
+        self._calib_scan_start = None
+        self._calib_scan_dir = 1
+        self.calib_rotate_speed = 0.6    # angular speed used while scanning (tunable)
+        self.calib_timeout = 6.0         # seconds to give up if no aruco seen
 
     # --- Lightweight logging for post-run visualization ---
         self._log = {
@@ -138,6 +157,8 @@ class AutoOperateDynamic(Operate):
                 'robot_radius': self.robot_radius,
                 'safety_margin': self.safety_margin,
                 'merge_threshold': self.merge_threshold,
+                'obs_max_range': self.obs_max_range,
+                'calib_interval': self.calib_interval,
             },
             'poses': [],      # each: [t, x, y, th]
             'plans': [],      # each: {t, waypoints: [[x,y], ...]}
@@ -234,13 +255,27 @@ class AutoOperateDynamic(Operate):
                     pygame.draw.circle(ekf_view, (40, 90, 220), p, 3)
 
         # Draw known + discovered obstacles (red X)
-        all_obs = []
-        all_obs.extend(self.known_obstacles)
-        all_obs.extend(self.discovered_obstacles)
-        for ox, oy in all_obs:
+        for ox, oy in self.known_obstacles:
             px, py = to_im((float(ox) - rx, float(oy) - ry))
             pygame.draw.line(ekf_view, (220, 50, 50), (px - 4, py - 4), (px + 4, py + 4), 2)
             pygame.draw.line(ekf_view, (220, 50, 50), (px - 4, py + 4), (px + 4, py - 4), 2)
+
+        for d in self.discovered_obstacles:
+            try:
+                ox, oy = float(d['x']), float(d['y'])
+            except Exception:
+                continue
+            px, py = to_im((ox - rx, oy - ry))
+            pygame.draw.line(ekf_view, (220, 50, 50), (px - 4, py - 4), (px + 4, py + 4), 2)
+            pygame.draw.line(ekf_view, (220, 50, 50), (px - 4, py + 4), (px + 4, py - 4), 2)
+            # draw label using the small label font (smaller text)
+            try:
+                lbl = str(d.get('label', ''))[:8]
+                if lbl and self.label_font is not None:
+                    lbl_surf = self.label_font.render(lbl, True, (240, 240, 240))
+                    ekf_view.blit(lbl_surf, (px + 6, py - 6))
+            except Exception:
+                pass
 
         # Draw virtual wall boundary (inner rectangle), if configured
         try:
@@ -260,6 +295,21 @@ class AutoOperateDynamic(Operate):
             rect_pts.append(rect_pts[0])
             for i in range(len(rect_pts) - 1):
                 pygame.draw.line(ekf_view, (120, 180, 120), rect_pts[i], rect_pts[i + 1], 2)
+
+        # --- Calibration / scan status overlay on ekf_view ---
+        try:
+            if self._calib_mode:
+                status_msg = "CALIBRATION SCAN: scanning for ArUco..."
+            else:
+                # show seconds until next calibration scan
+                seconds_left = max(0, int(self.calib_interval - (time.time() - self.last_calib_time)))
+                status_msg = f"Next calib in: {seconds_left}s"
+            if self.label_font is not None:
+                status_surf = self.label_font.render(status_msg, True, (255, 200, 0))
+                # place at top-left of ekf_view with small padding
+                ekf_view.blit(status_surf, (6, 6))
+        except Exception:
+            pass
 
         # Blit the augmented SLAM view back to the main canvas
         canvas.blit(ekf_view, slam_origin)
@@ -303,11 +353,110 @@ class AutoOperateDynamic(Operate):
         except Exception:
             pass
 
+    # --- Calibration helpers (new) ---
+    def start_calib_scan(self):
+        """Begin an in-place rotation scan looking for the first ArUco to calibrate against.
+        This pauses regular navigation control (no replanning) until calib finishes or times out.
+        """
+        if self._calib_mode:
+            return
+        self._calib_mode = True
+        self._calib_scan_start = time.time()
+        self._calib_scan_dir = 1
+        self.notification = "Starting periodic ArUco calibration scan..."
+        # Do not alter waypoints/current_goal — we will resume them after scan.
+
+    def _perform_calib_scan_step(self):
+        """Called by auto_nav_step while in calibration mode. Rotates and checks for ArUco tags."""
+        now = time.time()
+        # Timeout check
+        if (now - (self._calib_scan_start or now)) > self.calib_timeout:
+            self._calib_mode = False
+            self.last_calib_time = now
+            self.notification = "Calibration scan timed out — resuming navigation"
+            # stop motion immediately
+            self.command['motion'] = [0, 0]
+            return
+
+        # Alternate rotation direction every ~2s for a sweeping scan
+        elapsed = now - (self._calib_scan_start or now)
+        self._calib_scan_dir = 1 if int(elapsed // 2) % 2 == 0 else -1
+        # Set rotation command (rotate in place)
+        self.command['motion'] = [0, self._calib_scan_dir * self.calib_rotate_speed]
+
+        # Check for any ArUco tags visible in EKF taglist
+        taglist = getattr(self.ekf, 'taglist', []) or []
+        if len(taglist) > 0:
+            # take the first tag seen
+            tag = taglist[0]
+            self._on_aruco_seen_during_calib(tag)
+            self._calib_mode = False
+            self.last_calib_time = time.time()
+            # stop rotation
+            self.command['motion'] = [0, 0]
+            self.notification = "ArUco seen — calibration finished, resuming path"
+            return
+        # else keep rotating until timeout
+
+    def _on_aruco_seen_during_calib(self, tag):
+        """Handle a detected ArUco during a calibration scan.
+
+        This helper will attempt to use any EKF-facing method to incorporate the observation
+        (if your EKF/operate exposes something). If such a method doesn't exist it will log
+        the event and rely on normal EKF tag processing (most EKFs already ingest ArUco).
+        """
+        # Attempt to extract useful info from the tag structure
+        try:
+            # tag may be a dict with 'id'/'x'/'y' etc, or a tuple/list.
+            tag_id = None
+            tag_info = None
+            if isinstance(tag, dict):
+                tag_id = tag.get('id', None)
+                tag_info = tag
+            elif isinstance(tag, (list, tuple)):
+                # common EKF representations: (id, x, y, theta) or (id, pose_dict)
+                if len(tag) >= 1:
+                    tag_id = tag[0]
+                    tag_info = tag
+            # Try to call EKF helper if available (best-effort)
+            ekf = getattr(self, 'ekf', None)
+            if ekf is not None:
+                # Look for a method name that might exist in your EKF implementation
+                for fname in ('apply_aruco_fix', 'incorporate_aruco', 'register_aruco_observation', 'correct_pose_with_aruco'):
+                    if hasattr(ekf, fname):
+                        try:
+                            getattr(ekf, fname)(tag)  # type: ignore[misc]
+                            self.notification = f'Calibrated using ArUco (via ekf.{fname})'
+                            return
+                        except Exception:
+                            pass
+            # Fallback: just log the detection and leave EKF to handle it normally
+            self._log_obstacle(getattr(tag_info, 'x', 0.0) if isinstance(tag_info, object) else 0.0,
+                               getattr(tag_info, 'y', 0.0) if isinstance(tag_info, object) else 0.0,
+                               label=f'aruco_{tag_id}', method='calib-detect')
+            self._flush_log(force=False)
+        except Exception:
+            # safe fallback: do nothing special
+            pass
+
     def auto_nav_step(self):
         # Require SLAM
         if not self.ekf_on:
             self.command['motion'] = [0, 0]
             self.notification = 'Press ENTER to start SLAM'
+            return
+
+        # Periodic calibration trigger (non-blocking start)
+        try:
+            if (time.time() - self.last_calib_time) >= self.calib_interval and not self._calib_mode:
+                # Start an in-place rotation and scan; do not change path/waypoints
+                self.start_calib_scan()
+        except Exception:
+            pass
+
+        # If currently in calibration mode, do calib step and return (do not replan or move along path)
+        if self._calib_mode:
+            self._perform_calib_scan_step()
             return
 
         # Marker acquisition gate: scan and occasional creep until >=2 tags visible
@@ -319,7 +468,7 @@ class AutoOperateDynamic(Operate):
             self._log_pose(now)
             self._last_pose_log = now
         self._flush_log(force=False)
-        if tag_count < 2:
+        if tag_count < 4:
             if self._scan_start is None:
                 self._scan_start = now
                 self._scan_dir = 1
@@ -402,6 +551,11 @@ class AutoOperateDynamic(Operate):
     # ============= Planning =============
     def replan(self, initial: bool = False):
         """Plan waypoints from current pose to remaining targets, avoiding known+discovered obstacles."""
+        # If we are calibrating, do not replan (we want to return to the same path)
+        if self._calib_mode:
+            self.notification = "Calibration active — skipping replan"
+            return
+
         if not self.active:
             return
         if not self.remaining_targets:
@@ -412,7 +566,8 @@ class AutoOperateDynamic(Operate):
             return
         x, y, _ = self.get_pose()
         robot_xy = [x, y]
-        obstacles_xy = list(self.known_obstacles) + list(self.discovered_obstacles)
+        # convert discovered dicts to [x,y] for planner
+        obstacles_xy = list(self.known_obstacles) + [[float(d['x']), float(d['y'])] for d in self.discovered_obstacles]
         # Add virtual wall obstacles along the inner boundary at ±(arena_half - wall_clearance)
         inner = max(0.0, float(self.arena_half) - float(self.wall_clearance))
         if inner > 0.0:
@@ -455,20 +610,12 @@ class AutoOperateDynamic(Operate):
         if self.remaining_targets:
             ntx, nty = self.remaining_targets[0]
             # prune discovered obstacles (and metadata) that overlap the new current target location
-            keep_obs: List[List[float]] = []
-            keep_labels: List[str] = []
-            keep_counts: List[int] = []
-            for i, (ox, oy) in enumerate(self.discovered_obstacles):
+            keep_obs: List[dict] = []
+            for d in self.discovered_obstacles:
+                ox, oy = float(d['x']), float(d['y'])
                 if math.hypot(ox - ntx, oy - nty) > max(0.12, self.grid_res * 2):
-                    keep_obs.append([ox, oy])
-                    # Maintain metadata alignment if present
-                    if i < len(self.discovered_labels):
-                        keep_labels.append(self.discovered_labels[i])
-                    if i < len(self.discovered_counts):
-                        keep_counts.append(self.discovered_counts[i])
+                    keep_obs.append(d)
             self.discovered_obstacles = keep_obs
-            self.discovered_labels = keep_labels
-            self.discovered_counts = keep_counts
         if not self.remaining_targets:
             self.waypoints = []
             self.current_goal = None
@@ -540,6 +687,10 @@ class AutoOperateDynamic(Operate):
                 ox = x + d * math.cos(bearing)
                 oy = y + d * math.sin(bearing)
 
+            # Range gate: only accept detections within obs_max_range from the robot
+            if math.hypot(float(ox) - x, float(oy) - y) > self.obs_max_range:
+                continue
+
             # Ignore detections that correspond to the CURRENT target only
             if self.remaining_targets and self.remaining_labels:
                 current_label = str(self.remaining_labels[0]).lower()
@@ -560,46 +711,46 @@ class AutoOperateDynamic(Operate):
 
             # Suppress adding/merging if detection is near a fruit already present in the partial map
             if self.map_fruit_labels and self.map_fruit_xy:
+                skip_flag = False
                 for (mf_label, (mx, my)) in zip(self.map_fruit_labels, self.map_fruit_xy):
                     if mf_label == label and math.hypot(ox - float(mx), oy - float(my)) <= self.map_match_tol:
                         # Treat as known fruit from map; do not add as obstacle
-                        ox = oy = None  # invalidate to skip further processing
+                        skip_flag = True
                         break
-                if ox is None or oy is None:
+                if skip_flag:
                     continue
 
-            # First: try to merge with an existing discovered obstacle of the SAME label within merge_threshold
+            # --- Merge logic using dict-based discovered_obstacles ---
             merged = False
-            merge_idx = -1
-            for i, (px, py) in enumerate(self.discovered_obstacles):
-                if i < len(self.discovered_labels) and self.discovered_labels[i] == label:
+            for d in self.discovered_obstacles:
+                # only merge identical labels
+                if d.get('label') == label:
+                    px, py = float(d['x']), float(d['y'])
                     if math.hypot(ox - px, oy - py) <= self.merge_threshold:
-                        # Incremental mean update for the cluster centre
-                        cnt = self.discovered_counts[i] if i < len(self.discovered_counts) else 1
+                        # incremental mean update for cluster centre
+                        cnt = int(d.get('count', 1))
                         new_x = (px * cnt + ox) / (cnt + 1)
                         new_y = (py * cnt + oy) / (cnt + 1)
                         moved = math.hypot(new_x - px, new_y - py)
-                        self.discovered_obstacles[i] = [new_x, new_y]
-                        if i < len(self.discovered_counts):
-                            self.discovered_counts[i] = cnt + 1
-                        else:
-                            # ensure alignment if counts list was shorter
-                            self.discovered_counts.append(cnt + 1)
-                        # Log merge and optionally trigger replan if position changed
+                        d['x'] = new_x
+                        d['y'] = new_y
+                        d['count'] = cnt + 1
+                        # log merge (use your existing log helper)
                         self._log_obstacle(new_x, new_y, label=label, method=('merge-tpe' if used_tpe else 'merge-heuristic'))
                         self._flush_log(force=False)
                         if moved > 1e-3:
                             new_added = True
                         merged = True
-                        merge_idx = i
                         break
 
             if merged:
-                # merged into an existing cluster; skip adding/duplicate checks
+                # merged into an existing cluster; skip the rest of add process
                 continue
 
             # Ignore duplicates amongst known and discovered obstacles (any label) using a wider gate
-            all_obs = self.known_obstacles + self.discovered_obstacles
+            all_obs = []
+            all_obs.extend(self.known_obstacles)
+            all_obs.extend([[d['x'], d['y']] for d in self.discovered_obstacles])
             if any(math.hypot(ox - qx, oy - qy) <= self.min_obs_separation for qx, qy in all_obs):
                 continue
 
@@ -608,9 +759,7 @@ class AutoOperateDynamic(Operate):
                 continue
 
             # Add obstacle and mark for replanning
-            self.discovered_obstacles.append([ox, oy])
-            self.discovered_labels.append(label)
-            self.discovered_counts.append(1)
+            self.discovered_obstacles.append({'x': float(ox), 'y': float(oy), 'label': label, 'count': 1})
             self._log_obstacle(ox, oy, label=label, method=('tpe' if used_tpe else 'heuristic'))
             self._flush_log(force=False)
             self.last_obstacle_add_time = now
@@ -629,9 +778,12 @@ if __name__ == "__main__":
     parser.add_argument("--map", type=str, default=os.path.join(SCRIPT_DIR, "M3_prac_map_part.txt"))
     parser.add_argument("--list", type=str, default=os.path.join(SCRIPT_DIR, "M3_prac_shopping_list.txt"))
     parser.add_argument("--grid_res", type=float, default=0.02)
-    parser.add_argument("--robot_radius", type=float, default=0.12)
-    parser.add_argument("--safety_margin", type=float, default=0.15)
-    parser.add_argument("--merge_threshold", type=float, default=0.30)
+    parser.add_argument("--robot_radius", type=float, default=0.10)
+    parser.add_argument("--safety_margin", type=float, default=0.10)
+    # default merge threshold increased to 0.50 (50 cm)
+    parser.add_argument("--merge_threshold", type=float, default=0.50)
+    # only count/add obstacles when seen within this distance (meters)
+    parser.add_argument("--obs_max_range", type=float, default=0.45)
     parser.add_argument("--play_data", action='store_true')
     parser.add_argument("--save_data", action='store_true')
     args, _ = parser.parse_known_args()
@@ -688,6 +840,7 @@ if __name__ == "__main__":
                                  robot_radius=args.robot_radius,
                                  safety_margin=args.safety_margin,
                                  merge_threshold=args.merge_threshold,
+                                 obs_max_range=args.obs_max_range,
                                  map_fruit_labels=list(fruit_list),
                                  map_fruit_xy=[[float(fruit_pos[i, 0]), float(fruit_pos[i, 1])] for i in range(fruit_pos.shape[0])])
 
