@@ -145,7 +145,7 @@ class AutoOperateDynamic(Operate):
         self.fx = float(self.K[0, 0]) if self.K is not None else 320.0
 
         # Covariance-based stabilize spin parameters
-        self.cov_pos_thresh = 0.15        # trigger threshold on P[0,0]
+        self.cov_pos_thresh = 0.14      # trigger threshold on P[0,0]
         self.cov_spin_duration = 9.0      # seconds to spin when triggered (increased from 6s)
         self.cov_spin_cooldown = 3.0      # seconds to wait before checking again
         self._cov_spin_until = None       # type: ignore[assignment]
