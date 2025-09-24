@@ -59,7 +59,7 @@ class AutoOperateDynamic(Operate):
     def __init__(self, args, search_list: List[str], targets_xy: List[List[float]],
                  aruco_obstacles_xy: List[List[float]], grid_res: float,
                  robot_radius: float, safety_margin: float, merge_threshold: float = 0.50,
-                 obs_max_range: float = 0.45,
+                 obs_max_range: float = 0.30,
                  map_fruit_labels: List[str] | None = None,
                  map_fruit_xy: List[List[float]] | None = None):
         super().__init__(args)
@@ -107,7 +107,7 @@ class AutoOperateDynamic(Operate):
         self.reached_time: float | None = None
         self.active = True
         # waypoint arrival tolerance (meters)
-        self.dist_tol = 0.10
+        self.dist_tol = 0.075
         self.angle_tol = math.radians(8.0)
         # Make autonomous motions slower
         self.turn_cmd = 1
@@ -145,7 +145,7 @@ class AutoOperateDynamic(Operate):
         self.fx = float(self.K[0, 0]) if self.K is not None else 320.0
 
         # Covariance-based stabilize spin parameters
-        self.cov_pos_thresh = 0.32        # trigger threshold on P[0,0]
+        self.cov_pos_thresh = 0.15        # trigger threshold on P[0,0]
         self.cov_spin_duration = 9.0      # seconds to spin when triggered (increased from 6s)
         self.cov_spin_cooldown = 3.0      # seconds to wait before checking again
         self._cov_spin_until = None       # type: ignore[assignment]
@@ -765,7 +765,7 @@ class AutoOperateDynamic(Operate):
                 conf = float(det[2])
             except Exception:
                 continue
-            if conf < 0.4:
+            if conf < 0.8:
                 continue
 
             # Project detection to a world point using TargetPoseEst if available; otherwise fallback to heuristic
