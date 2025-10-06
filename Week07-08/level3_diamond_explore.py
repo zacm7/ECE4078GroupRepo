@@ -29,7 +29,7 @@ except Exception:
     Operate = operate_mod.Operate  # type: ignore
 
 # Import helpers and planner
-from map_utils import read_true_map_robust, load_search_list, print_target_fruits_pos
+from map_utils import load_search_list
 from astar_planning import plan_waypoints
 
 # Reuse advanced dynamic behaviours from wednesday.py if available
@@ -38,6 +38,12 @@ try:
     from wednesday import AutoOperateDynamic as BaseAuto  # type: ignore
 except Exception:
     BaseAuto = Operate  # fallback to raw Operate if import fails
+
+# Optional TargetPoseEst for projection
+try:
+    from TargetPoseEst import estimate_pose  # type: ignore
+except Exception:
+    estimate_pose = None  # type: ignore
 
 
 def normalize_angle(a: float) -> float:
@@ -81,29 +87,29 @@ class AutoOperateDiamond(BaseAuto):
                          map_fruit_xy=map_fruit_xy)
 
         # Phase management
-        self.phase: str = 'MAP'  # 'MAP' -> 'NAV'
+        self.phase = 'MAP'  # 'MAP' -> 'NAV'
 
         # Diamond scan points (meters)
-        self.base_scan_points: List[List[float]] = [
+        self.base_scan_points = [
             [1.0, 0.0],
             [0.0, 1.0],
             [-1.0, 0.0],
             [0.0, -1.0],
         ]
         # Adjusted scan points (avoid occupied spots)
-        self.scan_points: List[List[float]] = [self._adjust_scan_point(pt) for pt in self.base_scan_points]
-        self.scan_index: int = 0
+        self.scan_points = [self._adjust_scan_point(pt) for pt in self.base_scan_points]
+        self.scan_index = 0
 
         # Replace remaining_targets to follow scan points first
-        self.nav_targets_xy: List[List[float]] = [list(t) for t in targets_xy]  # keep for NAV phase
+        self.nav_targets_xy = [list(t) for t in targets_xy]  # in no-map, initially empty
         self.remaining_targets = [list(p) for p in self.scan_points]
         self.remaining_labels = [f'scan{i+1}' for i in range(len(self.remaining_targets))]
 
         # Pulse 360 scan settings at each scan point
         self.point_scan_duration = 8.0  # seconds to approximate 360 deg with pulsed spin
-        self._point_scan_active: bool = False
-        self._point_scan_start: float = 0.0
-        self._point_scan_dir: int = 1
+        self._point_scan_active = False
+        self._point_scan_start = 0.0
+        self._point_scan_dir = 1
 
         # Disable periodic ArUco calibration scans during mapping to avoid conflicts
         try:
@@ -122,6 +128,11 @@ class AutoOperateDiamond(BaseAuto):
             self._log['meta']['strategy'] = 'diamond_scan_then_nav'
         except Exception:
             pass
+
+        # Live-detected targets (label -> running mean world position)
+        self.detected_targets = {}
+        # Max range to accept a detected target for estimation (m)
+        self.target_max_range = max(0.8, float(self.obs_max_range) + 0.5)
 
     # ----------------- Utility helpers -----------------
     def get_pose(self) -> Tuple[float, float, float]:
@@ -205,6 +216,8 @@ class AutoOperateDiamond(BaseAuto):
             return
         x, y, _ = self.get_pose()
         obstacles_xy = list(self.known_obstacles) + [[float(d['x']), float(d['y'])] for d in self.discovered_obstacles]
+        # Include currently seen ArUco markers (if EKF exposes positions)
+        obstacles_xy.extend(self._current_aruco_obstacles())
         # Add virtual wall as obstacles
         inner = max(0.0, float(self.arena_half) - float(self.wall_clearance))
         if inner > 0.0:
@@ -217,6 +230,16 @@ class AutoOperateDiamond(BaseAuto):
             for yv in ys:
                 obstacles_xy.append([float(inner), float(yv)])
                 obstacles_xy.append([float(-inner), float(yv)])
+        # Do not block targets: remove obstacles that lie too close to any remaining target
+        try:
+            keep: List[List[float]] = []
+            tol = max(0.12, self.grid_res * 2)
+            for ox, oy in obstacles_xy:
+                if all(math.hypot(ox - tx, oy - ty) > tol for tx, ty in self.remaining_targets):
+                    keep.append([ox, oy])
+            obstacles_xy = keep
+        except Exception:
+            pass
         try:
             new_waypoints = plan_waypoints([x, y], self.remaining_targets, obstacles_xy,
                                            grid_res=self.grid_res,
@@ -267,9 +290,19 @@ class AutoOperateDiamond(BaseAuto):
         else:
             # Mapping finished -> switch to NAV phase
             self.phase = 'NAV'
-            self.remaining_targets = [list(t) for t in self.nav_targets_xy]
-            # keep labels aligned to search_list order
-            # self.remaining_labels already holds search_list from base
+            # Build NAV targets from live detections in shopping list order
+            nav_targets: List[List[float]] = []
+            new_labels: List[str] = []
+            try:
+                for lbl in self.search_list:
+                    d = self.detected_targets.get(lbl)
+                    if d is not None:
+                        nav_targets.append([float(d['x']), float(d['y'])])
+                        new_labels.append(lbl)
+            except Exception:
+                pass
+            self.remaining_targets = nav_targets
+            self.remaining_labels = new_labels
             self.replan_to_current_list(initial=True)
             self.notification = 'Diamond scan complete — switching to target navigation'
 
@@ -429,6 +462,105 @@ class AutoOperateDiamond(BaseAuto):
             else:
                 self.command['motion'] = [0, 0]
 
+    # ----------------- Perception: live target estimation -----------------
+    def _project_detection(self, label: str, xywh: np.ndarray, conf: float) -> Optional[Tuple[float, float]]:
+        if conf < 0.8:
+            return None
+        x, y, th = self.get_pose()
+        try:
+            if estimate_pose is not None and getattr(self, 'K', None) is not None:
+                obj_info = [label, [float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])]]
+                pose_dict = estimate_pose(self.K, obj_info, [x, y, th])  # type: ignore[arg-type]
+                if pose_dict and 'x' in pose_dict and 'y' in pose_dict:
+                    return float(pose_dict['x']), float(pose_dict['y'])
+        except Exception:
+            pass
+        # Fallback rough projection
+        try:
+            cx = float(self.cx) if hasattr(self, 'cx') else 160.0
+            fx = float(self.fx) if hasattr(self, 'fx') else 320.0
+            u = float(xywh[0]); w_px = float(xywh[2])
+            alpha = math.atan((u - cx) / max(1e-6, fx))
+            bearing = th + alpha
+            W_assumed = 0.10
+            if w_px <= 1.0:
+                d = 0.5
+            else:
+                d = max(0.35, min(1.10, (fx * W_assumed) / w_px))
+            ox = x + d * math.cos(bearing)
+            oy = y + d * math.sin(bearing)
+            return ox, oy
+        except Exception:
+            return None
+
+    def update_target_estimates(self):
+        bboxes = getattr(self, 'detector_output', None)
+        if not isinstance(bboxes, (list, tuple)) or len(bboxes) == 0:
+            return
+        x, y, _ = self.get_pose()
+        for det in bboxes:
+            try:
+                label: str = str(det[0]).lower()
+                if label not in self.search_list:
+                    continue  # only care about shopping-list fruits as targets
+                xywh = np.asarray(det[1]).astype(float)
+                conf = float(det[2])
+            except Exception:
+                continue
+            pos = self._project_detection(label, xywh, conf)
+            if pos is None:
+                continue
+            ox, oy = float(pos[0]), float(pos[1])
+            # Range gate for targets
+            if math.hypot(ox - x, oy - y) > self.target_max_range:
+                continue
+            # Incremental mean update
+            d = self.detected_targets.get(label)
+            if d is None:
+                self.detected_targets[label] = {'x': ox, 'y': oy, 'count': 1.0}
+            else:
+                cnt = float(d.get('count', 1.0))
+                d['x'] = (d['x'] * cnt + ox) / (cnt + 1.0)
+                d['y'] = (d['y'] * cnt + oy) / (cnt + 1.0)
+                d['count'] = cnt + 1.0
+        # If in NAV phase and we were missing some targets, append newly seen ones
+        if self.phase == 'NAV':
+            try:
+                known_labels = set(self.remaining_labels or [])
+                for lbl in self.search_list:
+                    if lbl in known_labels:
+                        continue
+                    d = self.detected_targets.get(lbl)
+                    if d is not None:
+                        self.remaining_targets.append([float(d['x']), float(d['y'])])
+                        self.remaining_labels.append(lbl)
+                        # Replan to include this new target
+                        self.replan_to_current_list(initial=False)
+            except Exception:
+                pass
+
+    def _current_aruco_obstacles(self) -> List[List[float]]:
+        out: List[List[float]] = []
+        try:
+            taglist = getattr(self.ekf, 'taglist', []) or []
+            for t in taglist:
+                # t may be dict or tuple/list; try to extract x,y
+                if isinstance(t, dict):
+                    tx = t.get('x', None); ty = t.get('y', None)
+                    if tx is not None and ty is not None:
+                        out.append([float(tx), float(ty)])
+                elif isinstance(t, (list, tuple)):
+                    # common patterns: (id, x, y, th) or (id, {'x':..,'y':..})
+                    if len(t) >= 3 and isinstance(t[1], (int, float)) and isinstance(t[2], (int, float)):
+                        out.append([float(t[1]), float(t[2])])
+                    elif len(t) >= 2 and isinstance(t[1], dict):
+                        tx = t[1].get('x', None); ty = t[1].get('y', None)
+                        if tx is not None and ty is not None:
+                            out.append([float(tx), float(ty)])
+        except Exception:
+            pass
+        return out
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Level 3: Diamond mapping tour then navigation")
@@ -436,8 +568,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--calib_dir", type=str, default=os.path.join(REPO_ROOT, "Week02-04", "calibration", "param") + os.sep)
     parser.add_argument("--yolo_model", default=os.path.join(SCRIPT_DIR, "YOLO", "model", "bestv5.pt"))
-    parser.add_argument("--map", type=str, default=os.path.join(SCRIPT_DIR, "M3_prac_map_part.txt"))
-    parser.add_argument("--list", type=str, default=os.path.join(SCRIPT_DIR, "M3_prac_shopping_list.txt"))
+    parser.add_argument("--list", type=str, default=os.path.join(SCRIPT_DIR, "Final_demo_shopping_list.txt"))
     parser.add_argument("--grid_res", type=float, default=0.02)
     parser.add_argument("--robot_radius", type=float, default=0.16)
     parser.add_argument("--safety_margin", type=float, default=0.3)
@@ -470,23 +601,11 @@ if __name__ == "__main__":
         pass
     canvas.fill((0, 0, 0))
 
-    # Load partial map + shopping list, print targets
-    fruit_list, fruit_pos, aruco_pos = read_true_map_robust(args.map)
+    # Load shopping list only (no map in Final Demo L3)
     search_list = load_search_list(args.list)
-    print_target_fruits_pos(search_list, fruit_list, fruit_pos)
-
-    # Build targets (in order) from partial map; obstacles initially only ArUcos
+    # No prior targets or known ArUcos — discover everything live
     targets_xy: List[List[float]] = []
-    for ft in search_list:
-        found = False
-        for i, name in enumerate(fruit_list):
-            if name == ft:
-                targets_xy.append([float(fruit_pos[i, 0]), float(fruit_pos[i, 1])])
-                found = True
-                break
-        if not found:
-            raise ValueError(f"Target '{ft}' not found in partial map")
-    aruco_obstacles_xy: List[List[float]] = [[float(aruco_pos[k, 0]), float(aruco_pos[k, 1])] for k in range(aruco_pos.shape[0])]
+    aruco_obstacles_xy: List[List[float]] = []
 
     # Ensure Week05-06 relative asset paths in operate.py resolve
     try:
@@ -500,8 +619,8 @@ if __name__ == "__main__":
                                  safety_margin=args.safety_margin,
                                  merge_threshold=args.merge_threshold,
                                  obs_max_range=args.obs_max_range,
-                                 map_fruit_labels=list(fruit_list),
-                                 map_fruit_xy=[[float(fruit_pos[i, 0]), float(fruit_pos[i, 1])] for i in range(fruit_pos.shape[0])])
+                                 map_fruit_labels=None,
+                                 map_fruit_xy=None)
 
     running = True
     while running:
@@ -515,6 +634,9 @@ if __name__ == "__main__":
         operate.record_data()
         operate.save_image()
         operate.detect_target()  # detector_output populated
+        # Update target estimates from detections (shopping-list labels only)
+        if hasattr(operate, 'update_target_estimates'):
+            operate.update_target_estimates()  # type: ignore[misc]
         # Perception update to add obstacles + replan if needed (from BaseAuto)
         if hasattr(operate, 'periodic_perception_update'):
             operate.periodic_perception_update()  # type: ignore[misc]
