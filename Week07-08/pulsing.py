@@ -59,7 +59,7 @@ class AutoOperateDynamic(Operate):
     def __init__(self, args, search_list: List[str], targets_xy: List[List[float]],
                  aruco_obstacles_xy: List[List[float]], grid_res: float,
                  robot_radius: float, safety_margin: float, merge_threshold: float = 0.50,
-                 obs_max_range: float = 0.45,
+                 obs_max_range: float = 0.30,
                  map_fruit_labels: List[str] | None = None,
                  map_fruit_xy: List[List[float]] | None = None):
         super().__init__(args)
@@ -79,6 +79,17 @@ class AutoOperateDynamic(Operate):
         # each item: {'x': float, 'y': float, 'label': str, 'count': int}
         self.discovered_obstacles: List[dict] = []
 
+        # Lock EKF landmarks to fixed ArUco positions from the partial map
+        try:
+            if hasattr(self, 'ekf') and self.ekf is not None:
+                # Ensure a (10,2) float array if possible
+                ap = np.array(self.known_obstacles, dtype=float)
+                if ap.ndim == 2 and ap.shape[1] == 2:
+                    self.ekf.fixed_aruco_pos = ap
+                    self.ekf.lock_aruco = True
+        except Exception:
+            pass
+
         # Map fruit ground truth (labels and positions) to suppress obstacle adds near known fruits
         self.map_fruit_labels: List[str] = [str(s).lower() for s in (map_fruit_labels or [])]
         self.map_fruit_xy: List[List[float]] = [list(p) for p in (map_fruit_xy or [])]
@@ -96,8 +107,9 @@ class AutoOperateDynamic(Operate):
         self.reached_time: float | None = None
         self.active = True
         # waypoint arrival tolerance (meters)
-        self.dist_tol = 0.10
+        self.dist_tol = 0.075
         self.angle_tol = math.radians(8.0)
+        # Make autonomous motions slower
         self.turn_cmd = 1
         self.fwd_cmd = 1
 
@@ -108,7 +120,7 @@ class AutoOperateDynamic(Operate):
         self._planned_once = False
 
         # Arrival reverse behavior
-        self.hold_duration = 2.5
+        self.hold_duration = 3.0
         self.reverse_duration = 0.5
         self._reverse_until = None
         self._pending_complete_after_reverse = False
@@ -119,6 +131,8 @@ class AutoOperateDynamic(Operate):
         self.min_obs_separation = 0.15  # m
         # Merge detections of the same obstacle label within this radius (m)
         self.merge_threshold = float(merge_threshold)
+        # Larger merge threshold for non-target fruits to cluster more aggressively
+        self.merge_threshold_non_target = float(self.merge_threshold) + 0.20
         # Only consider detections as obstacles if within this distance (m) from the robot
         self.obs_max_range = float(obs_max_range)
         # Arena virtual walls (2.4x2.4m centered at origin) with 10cm keep-out
@@ -129,6 +143,29 @@ class AutoOperateDynamic(Operate):
         self.K = getattr(self.ekf.robot, 'camera_matrix', None)
         self.cx = float(self.K[0, 2]) if self.K is not None else 160.0
         self.fx = float(self.K[0, 0]) if self.K is not None else 320.0
+
+        # Covariance-based stabilize spin parameters
+        self.cov_pos_thresh = 0.14      # trigger threshold on P[0,0]
+        self.cov_spin_duration = 9.0      # seconds to spin when triggered (increased from 6s)
+        self.cov_spin_cooldown = 3.0      # seconds to wait before checking again
+        self._cov_spin_until = None       # type: ignore[assignment]
+        self._cov_cooldown_until = 0.0
+        self._cov_spin_dir = 1            # alternate spin direction each trigger
+        # Pulsed spin timing: spin for 0.4s, stop for 0.2s, repeat
+        self.cov_pulse_spin_time = 0.4
+        self.cov_pulse_stop_time = 0.2
+        self._cov_spin_start = None       # type: ignore[assignment]
+
+        # Navigation pulse timing (normal turn/drive):
+        # - Turning: spin 0.4s, stop 0.2s (same as covariance spin)
+        # - Driving forward: period 1.0s with 0.2s stop per second
+        self.nav_turn_pulse_spin_time = 0.4
+        self.nav_turn_pulse_stop_time = 0.2
+        self.nav_drive_pulse_period = 0.55
+        self.nav_drive_pulse_stop_time = 0.2
+        self._nav_turn_pulse_start = None  # type: ignore[assignment]
+        self._nav_drive_pulse_start = None  # type: ignore[assignment]
+        self._nav_last_mode = None  # 'turn' | 'drive' | None
 
         # Small font used for overlay labels (smaller text)
         # pygame.font.init() is called in __main__ before the operate instance is created,
@@ -147,7 +184,7 @@ class AutoOperateDynamic(Operate):
         self.calib_rotate_speed = 0.6    # angular speed used while scanning (tunable)
         self.calib_timeout = 6.0         # seconds to give up if no aruco seen
 
-    # --- Lightweight logging for post-run visualization ---
+        # --- Lightweight logging for post-run visualization ---
         self._log = {
             'meta': {
                 'search_list': list(self.search_list),
@@ -321,6 +358,14 @@ class AutoOperateDynamic(Operate):
             t = time.time() if now is None else now
             x, y, th = self.get_pose()
             self._log['poses'].append([t, float(x), float(y), float(th)])
+            # Also print the covariance of the robot's position (top-left 2x2 of EKF covariance)
+            try:
+                P = getattr(self.ekf, 'P', None)
+                if isinstance(P, np.ndarray) and P.shape[0] >= 2 and P.shape[1] >= 2:
+                    Pxy = P[0:2, 0:2]
+                    print("Robot position covariance (P[0:2,0:2]):\n", Pxy)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -446,6 +491,47 @@ class AutoOperateDynamic(Operate):
             self.notification = 'Press ENTER to start SLAM'
             return
 
+        # --- High covariance stabilize spin (preempts other actions) ---
+        try:
+            now_cov = time.time()
+            # If currently spinning due to high covariance, keep spinning until timeout
+            if self._cov_spin_until is not None and now_cov < self._cov_spin_until:
+                # Pulsed behavior: rotate for cov_pulse_spin_time then stop for cov_pulse_stop_time
+                if self._cov_spin_start is None:
+                    self._cov_spin_start = now_cov
+                period = float(self.cov_pulse_spin_time + self.cov_pulse_stop_time)
+                phase = (now_cov - self._cov_spin_start) % period
+                if phase < self.cov_pulse_spin_time:
+                    self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
+                    self.notification = 'High covariance: stabilizing spin'
+                else:
+                    self.command['motion'] = [0, 0]
+                    self.notification = 'High covariance: stabilizing spin (pulse stop)'
+                return
+            # If a spin just finished, start cooldown timer and resume
+            if self._cov_spin_until is not None and now_cov >= self._cov_spin_until:
+                self._cov_spin_until = None
+                self._cov_spin_start = None
+                self._cov_cooldown_until = now_cov + self.cov_spin_cooldown
+            # If in cooldown, skip covariance checks
+            if now_cov < self._cov_cooldown_until:
+                pass  # proceed with normal behavior
+            else:
+                # Check EKF position covariance P[0,0]
+                P = getattr(self.ekf, 'P', None)
+                if isinstance(P, np.ndarray) and P.shape[0] >= 2 and P.shape[1] >= 2:
+                    pxx = float(P[0, 0])
+                    if pxx > float(self.cov_pos_thresh):
+                        # trigger spin
+                        self._cov_spin_dir = -self._cov_spin_dir  # alternate direction
+                        self._cov_spin_until = now_cov + float(self.cov_spin_duration)
+                        self._cov_spin_start = now_cov
+                        self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
+                        self.notification = 'High covariance: stabilizing spin'
+                        return
+        except Exception:
+            pass
+
         # Periodic calibration trigger (non-blocking start)
         try:
             if (time.time() - self.last_calib_time) >= self.calib_interval and not self._calib_mode:
@@ -468,7 +554,7 @@ class AutoOperateDynamic(Operate):
             self._log_pose(now)
             self._last_pose_log = now
         self._flush_log(force=False)
-        if tag_count < 3:
+        if tag_count < 2:
             if self._scan_start is None:
                 self._scan_start = now
                 self._scan_dir = 1
@@ -541,12 +627,37 @@ class AutoOperateDynamic(Operate):
                 self.pick_next_goal()
                 return
 
-        # Turn-then-drive
-        if abs(dheading) > self.angle_tol:
-            # Rotate in place to reduce heading error before moving
-            self.command['motion'] = [0, self.turn_cmd if dheading > 0 else -self.turn_cmd]
+        # Turn-then-drive (with pulsed motion)
+        turning = abs(dheading) > self.angle_tol
+        if turning:
+            now = time.time()
+            if self._nav_last_mode != 'turn':
+                self._nav_last_mode = 'turn'
+                self._nav_turn_pulse_start = now
+            if self._nav_turn_pulse_start is None:
+                self._nav_turn_pulse_start = now
+            t_period = float(self.nav_turn_pulse_spin_time + self.nav_turn_pulse_stop_time)
+            t_phase = (now - self._nav_turn_pulse_start) % t_period
+            if t_phase < self.nav_turn_pulse_spin_time:
+                # rotate in place
+                self.command['motion'] = [0, self.turn_cmd if dheading > 0 else -self.turn_cmd]
+            else:
+                # pulse stop
+                self.command['motion'] = [0, 0]
         else:
-            self.command['motion'] = [self.fwd_cmd, 0]
+            now = time.time()
+            if self._nav_last_mode != 'drive':
+                self._nav_last_mode = 'drive'
+                self._nav_drive_pulse_start = now
+            if self._nav_drive_pulse_start is None:
+                self._nav_drive_pulse_start = now
+            d_period = float(self.nav_drive_pulse_period)
+            d_phase = (now - self._nav_drive_pulse_start) % d_period
+            # drive for (period - stop_time) then hold for stop_time
+            if d_phase < (self.nav_drive_pulse_period - self.nav_drive_pulse_stop_time):
+                self.command['motion'] = [self.fwd_cmd, 0]
+            else:
+                self.command['motion'] = [0, 0]
 
     # ============= Planning =============
     def replan(self, initial: bool = False):
@@ -654,7 +765,7 @@ class AutoOperateDynamic(Operate):
                 conf = float(det[2])
             except Exception:
                 continue
-            if conf < 0.4:
+            if conf < 0.8:
                 continue
 
             # Project detection to a world point using TargetPoseEst if available; otherwise fallback to heuristic
@@ -722,11 +833,20 @@ class AutoOperateDynamic(Operate):
 
             # --- Merge logic using dict-based discovered_obstacles ---
             merged = False
+            # Select merge threshold: larger for non-target fruits
+            current_label_merge = None
+            if self.remaining_targets and self.remaining_labels:
+                try:
+                    current_label_merge = str(self.remaining_labels[0]).lower()
+                except Exception:
+                    current_label_merge = None
+            use_merge_thr = self.merge_threshold_non_target if (current_label_merge is None or label != current_label_merge) else self.merge_threshold
+
             for d in self.discovered_obstacles:
                 # only merge identical labels
                 if d.get('label') == label:
                     px, py = float(d['x']), float(d['y'])
-                    if math.hypot(ox - px, oy - py) <= self.merge_threshold:
+                    if math.hypot(ox - px, oy - py) <= use_merge_thr:
                         # incremental mean update for cluster centre
                         cnt = int(d.get('count', 1))
                         new_x = (px * cnt + ox) / (cnt + 1)
@@ -781,7 +901,7 @@ if __name__ == "__main__":
     parser.add_argument("--robot_radius", type=float, default=0.10)
     parser.add_argument("--safety_margin", type=float, default=0.10)
     # default merge threshold increased to 0.50 (50 cm)
-    parser.add_argument("--merge_threshold", type=float, default=0.50)
+    parser.add_argument("--merge_threshold", type=float, default=0.75)
     # only count/add obstacles when seen within this distance (meters)
     parser.add_argument("--obs_max_range", type=float, default=0.45)
     parser.add_argument("--play_data", action='store_true')

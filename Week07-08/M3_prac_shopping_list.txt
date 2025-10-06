@@ -1,5 +1,5 @@
+lemon
 garlic
-pear
-tomato
 potato
-orange
+capsicum
+pumpkin
