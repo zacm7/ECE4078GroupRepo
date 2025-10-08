@@ -52,9 +52,10 @@ class AutoOperateDynamic(Operate):
     """Mapless dynamic exploration + obstacle discovery.
 
     - No prior partial map (no known fruit / ArUCo positions at start).
-    - Discovers first seen ArUCo marker, navigates to it, spins to stabilize.
-    - Then visits 4 fixed waypoints while dynamically adding obstacles from detections.
-    - Maintains virtual arena boundary.
+    - Performs a startup localization spin, then visits 4 fixed waypoints.
+    - Fruits and ArUCo markers are BOTH treated as obstacles immediately.
+    - ArUCo markers are inflated into a small ring of obstacle points for stronger avoidance.
+    - Maintains a virtual arena boundary.
     """
 
     def __init__(self, args, search_list: List[str], targets_xy: List[List[float]],
@@ -199,16 +200,12 @@ class AutoOperateDynamic(Operate):
         self.calib_rotate_speed = 0.6    # angular speed used while scanning (tunable)
         self.calib_timeout = 6.0         # seconds to give up if no aruco seen
 
-        # -------- Initial marker acquisition + spin (Step 1) --------
-        # New behavior: before visiting the fixed 4 points, go to the nearest
-        # ArUco marker first observed, then perform an in-place spin for improved
-        # localization.
-        self.initial_marker_stage = True
-        self.marker_target_xy = None
-        self.marker_spin_phase = None   # 'spinning' or None
-        self.marker_spin_start_time = 0.0
-        self.marker_spin_duration = 6     # seconds to spin at marker
-        # Post-marker fixed waypoint tour
+        # -------- Startup spin (replaces initial marker acquisition) --------
+        # Perform a localization spin in place at launch, then immediately execute fixed waypoints.
+        self.startup_spin = True
+        self.startup_spin_start_time = 0.0
+        self.marker_spin_duration = 6.0   # reuse parameter name for consistency
+        # Fixed waypoint tour (front, left, back, right)
         self.post_marker_waypoints = [
             [0.0, 1.0],
             [-1.0, 0.0],
@@ -216,6 +213,9 @@ class AutoOperateDynamic(Operate):
             [1.0, 0.0],
         ]
         self.post_marker_labels = ["pt_front", "pt_left", "pt_back", "pt_right"]
+        # Seed remaining targets immediately; no preliminary marker goal
+        self.remaining_targets = [list(p) for p in self.post_marker_waypoints]
+        self.remaining_labels = [lbl for lbl in self.post_marker_labels]
 
     # Dynamic ArUCo tracking (mapless): we maintain ids already added to obstacles
         self._dynamic_aruco_ids = set()
@@ -229,11 +229,10 @@ class AutoOperateDynamic(Operate):
         # Rate-limit update checks to avoid excessive replans
         self.aruco_update_check_interval = 1.0  # seconds
         self._last_aruco_update_check = 0.0
-    # ArUCo obstacles now use the SAME handling as fruit obstacles (single point only).
-    # (Previously we added an inflated ring via aruco_inflate_radius.)
-    # Leftover params (not used) could be removed entirely; kept commented for quick revert.
-    # self.aruco_inflate_radius = 0.22
-    # self.aruco_inflate_step_deg = 30
+        # ArUCo inflation configuration (explicit ring of obstacle points per marker)
+        self.aruco_inflate_radius = 0.20  # meters
+        self.aruco_inflate_step_deg = 30  # degrees between samples
+        self.aruco_inflate_enabled = True
 
         # --- Lightweight logging for post-run visualization ---
         self._log = {
@@ -554,22 +553,21 @@ class AutoOperateDynamic(Operate):
             pass
 
     def auto_nav_step(self):
-        # Require SLAM
+        """One control/update step of autonomous navigation."""
+        # Require SLAM first
         if not self.ekf_on:
             self.command['motion'] = [0, 0]
             self.notification = 'Press ENTER to start SLAM'
             return
 
-        # --- High covariance stabilize spin (preempts other actions) ---
+        # 1. High covariance stabilization spin (preempts everything else)
+        now = time.time()
         try:
-            now_cov = time.time()
-            # If currently spinning due to high covariance, keep spinning until timeout
-            if self._cov_spin_until is not None and now_cov < self._cov_spin_until:
-                # Pulsed behavior: rotate for cov_pulse_spin_time then stop for cov_pulse_stop_time
+            if self._cov_spin_until is not None and now < self._cov_spin_until:
                 if self._cov_spin_start is None:
-                    self._cov_spin_start = now_cov
+                    self._cov_spin_start = now
                 period = float(self.cov_pulse_spin_time + self.cov_pulse_stop_time)
-                phase = (now_cov - self._cov_spin_start) % period
+                phase = (now - self._cov_spin_start) % period
                 if phase < self.cov_pulse_spin_time:
                     self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
                     self.notification = 'High covariance: stabilizing spin'
@@ -577,249 +575,60 @@ class AutoOperateDynamic(Operate):
                     self.command['motion'] = [0, 0]
                     self.notification = 'High covariance: stabilizing spin (pulse stop)'
                 return
-            # If a spin just finished, start cooldown timer and resume
-            if self._cov_spin_until is not None and now_cov >= self._cov_spin_until:
+            if self._cov_spin_until is not None and now >= self._cov_spin_until:
+                # spin finished
                 self._cov_spin_until = None
                 self._cov_spin_start = None
-                self._cov_cooldown_until = now_cov + self.cov_spin_cooldown
-            # If in cooldown, skip covariance checks
-            if now_cov < self._cov_cooldown_until:
-                pass  # proceed with normal behavior
-            else:
-                # Check EKF position covariance P[0,0]
+                self._cov_cooldown_until = now + self.cov_spin_cooldown
+            if now >= self._cov_cooldown_until:
                 P = getattr(self.ekf, 'P', None)
                 if isinstance(P, np.ndarray) and P.shape[0] >= 2 and P.shape[1] >= 2:
                     pxx = float(P[0, 0])
                     if pxx > float(self.cov_pos_thresh):
-                        # trigger spin
-                        self._cov_spin_dir = -self._cov_spin_dir  # alternate direction
-                        self._cov_spin_until = now_cov + float(self.cov_spin_duration)
-                        self._cov_spin_start = now_cov
+                        self._cov_spin_dir = -self._cov_spin_dir
+                        self._cov_spin_until = now + float(self.cov_spin_duration)
+                        self._cov_spin_start = now
                         self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
                         self.notification = 'High covariance: stabilizing spin'
                         return
         except Exception:
             pass
 
-        # Periodic calibration trigger (non-blocking start)
+        # 2. Periodic calibration (non-blocking trigger)
         try:
-            if (time.time() - self.last_calib_time) >= self.calib_interval and not self._calib_mode:
-                # Start an in-place rotation and scan; do not change path/waypoints
+            if (now - self.last_calib_time) >= self.calib_interval and not self._calib_mode:
                 self.start_calib_scan()
         except Exception:
             pass
-
-        # If currently in calibration mode, do calib step and return (do not replan or move along path)
         if self._calib_mode:
             self._perform_calib_scan_step()
             return
 
-        # -------- Initial Marker Acquisition + Spin (Step 1) --------
-        # While in initial_marker_stage we:
-        #  (a) look for at least 1 tag (scan), set marker_target_xy = its world pos (EKF's fixed list)
-        #  (b) plan and drive to that marker position
-        #  (c) on arrival, perform a timed spin in place
-        #  (d) then seed remaining_targets with fixed post-marker waypoints and proceed as usual
-
+        # 3. Startup spin (localization) before beginning waypoint traversal
         taglist = getattr(self.ekf, 'taglist', []) or []
         tag_count = len(taglist)
-        now = time.time()
+        if self.startup_spin:
+            if self.startup_spin_start_time == 0.0:
+                self.startup_spin_start_time = now
+            spin_elapsed = now - self.startup_spin_start_time
+            if spin_elapsed < self.marker_spin_duration:
+                self.command['motion'] = [0, self.turn_cmd]
+                self.notification = f'Startup spin: {spin_elapsed:.1f}s/{self.marker_spin_duration:.0f}s'
+                return
+            # Spin complete
+            self.startup_spin = False
+            self.waypoints = []
+            self.current_goal = None
+            self._planned_once = False
+            self.replan(initial=True)
+            self.pick_next_goal()
+            self.notification = 'Startup spin complete: proceeding to waypoints'
 
-        if self.initial_marker_stage:
-            # If we have no marker target yet, attempt to pick first visible tag's fixed position
-            if self.marker_target_xy is None:
-                if tag_count == 0:
-                    # Scan in place (alternate direction every 2s)
-                    if self._scan_start is None:
-                        self._scan_start = now
-                    elapsed = now - self._scan_start
-                    scan_dir = 1 if int(elapsed // 2) % 2 == 0 else -1
-                    self.command['motion'] = [0, scan_dir * self.turn_cmd]
-                    self.notification = 'Step1: searching for first ArUco marker'
-                    return
-                else:
-                    # Acquire marker target: use first tag's pose from EKF fixed positions if available
-                    # Fallback: use robot-relative bearing approximation (here just stop scanning)
-                    try:
-                        # Many EKF impls store taglist entries with index referencing fixed_aruco_pos
-                        # We'll attempt to recover a global (x,y) via ekf.fixed_aruco_pos if id available
-                        t0 = taglist[0]
-                        tag_id = None
-                        if isinstance(t0, dict):
-                            tag_id = t0.get('id', None)
-                        elif isinstance(t0, (list, tuple)) and len(t0) >= 1:
-                            tag_id = t0[0]
-                        fxpos = getattr(self.ekf, 'fixed_aruco_pos', None)
-                        if tag_id is not None and fxpos is not None and int(tag_id) < fxpos.shape[0]:
-                            self.marker_target_xy = [float(fxpos[int(tag_id), 0]), float(fxpos[int(tag_id), 1])]
-                        else:
-                            # fallback: pick current robot position (already localized) – will immediately start spin
-                            rx, ry, _ = self.get_pose()
-                            self.marker_target_xy = [rx, ry]
-                    except Exception:
-                        rx, ry, _ = self.get_pose()
-                        self.marker_target_xy = [rx, ry]
-                    # Initialize a plan to marker_target_xy only
-                    self.remaining_targets = [list(self.marker_target_xy)]
-                    self.remaining_labels = ['marker']
-                    self.waypoints = []
-                    self.current_goal = None
-                    self._planned_once = False
-                    self.replan(initial=True)
-                    self.pick_next_goal()
-                    self.notification = 'Step1: acquired marker target, navigating'
-                    return
+        # 4. (ArUCo dynamic obstacle integration moved to periodic_perception_update)
 
-            # We have a marker target; navigate until we arrive (within dist_tol)
-            if self.marker_target_xy is not None and self.marker_spin_phase is None:
-                # Standard goal control as below but simplified
-                if self.current_goal is None and self.waypoints:
-                    self.pick_next_goal()
-                if self.current_goal is None and not self.waypoints:
-                    # directly drive toward marker target
-                    tx, ty = self.marker_target_xy
-                    rx, ry, rth = self.get_pose()
-                    dx, dy = tx - rx, ty - ry
-                    dist = math.hypot(dx, dy)
-                    if dist <= self.dist_tol:
-                        # Start spin phase
-                        self.marker_spin_phase = 'spinning'
-                        self.marker_spin_start_time = now
-                        self.command['motion'] = [0, self.turn_cmd]
-                        self.notification = 'Step1: at marker, spinning to localize'
-                        return
-                    bearing = math.atan2(dy, dx)
-                    dheading = angle_diff(bearing, rth)
-                    if abs(dheading) > self.angle_tol:
-                        self.command['motion'] = [0, self.turn_cmd if dheading > 0 else -self.turn_cmd]
-                    else:
-                        self.command['motion'] = [self.fwd_cmd, 0]
-                    self.notification = 'Step1: driving to marker'
-                    return
-                else:
-                    # Follow planned waypoints toward marker
-                    if self.current_goal is None and self.waypoints:
-                        self.pick_next_goal()
-                    if self.current_goal is not None:
-                        gx, gy = self.current_goal
-                        rx, ry, rth = self.get_pose()
-                        dx, dy = gx - rx, gy - ry
-                        dist = math.hypot(dx, dy)
-                        if dist <= self.dist_tol:
-                            if self.waypoints:
-                                self.pick_next_goal()
-                            else:
-                                # Arrived at last waypoint near marker target
-                                self.marker_spin_phase = 'spinning'
-                                self.marker_spin_start_time = now
-                                self.command['motion'] = [0, self.turn_cmd]
-                                self.notification = 'Step1: at marker, spinning to localize'
-                                return
-                        else:
-                            bearing = math.atan2(dy, dx)
-                            dheading = angle_diff(bearing, rth)
-                            if abs(dheading) > self.angle_tol:
-                                self.command['motion'] = [0, self.turn_cmd if dheading > 0 else -self.turn_cmd]
-                            else:
-                                self.command['motion'] = [self.fwd_cmd, 0]
-                            self.notification = 'Step1: navigating to marker'
-                            return
-
-            # Spin phase
-            if self.marker_spin_phase == 'spinning':
-                spin_elapsed = now - self.marker_spin_start_time
-                if spin_elapsed < self.marker_spin_duration:
-                    # Continue spinning (pulsed optional; keep simple constant spin)
-                    self.command['motion'] = [0, self.turn_cmd]
-                    self.notification = f'Step1: spinning ({spin_elapsed:.1f}s/{self.marker_spin_duration:.0f}s)'
-                    return
-                else:
-                    # Finish step1: seed remaining_targets with post-marker waypoints
-                    self.initial_marker_stage = False
-                    self.marker_spin_phase = None
-                    self.remaining_targets = [list(p) for p in self.post_marker_waypoints]
-                    self.remaining_labels = [lbl for lbl in self.post_marker_labels]
-                    self.waypoints = []
-                    self.current_goal = None
-                    self._planned_once = False
-                    # After completing the initial spin, add all currently visible ArUCo markers as obstacles
-                    try:
-                        print("aoijorj")
-                        current_tags = getattr(self.ekf, 'taglist', []) or []
-                        fxpos_all = getattr(self.ekf, 'fixed_aruco_pos', None)
-                        for t in current_tags:
-                            tag_id = None
-                            if isinstance(t, dict):
-                                tag_id = t.get('id', None)
-                            elif isinstance(t, (list, tuple)) and len(t) >= 1:
-                                tag_id = t[0]
-                            if tag_id is None:
-                                continue
-                            tid = int(tag_id)
-                            if tid in self._dynamic_aruco_ids:
-                                continue
-                            gx = gy = None
-                            if fxpos_all is not None and tid < fxpos_all.shape[0]:
-                                gx = float(fxpos_all[tid, 0]); gy = float(fxpos_all[tid, 1])
-                            else:
-                                rx, ry, rth = self.get_pose()
-                                gx = rx + 0.5 * math.cos(rth)
-                                gy = ry + 0.5 * math.sin(rth)
-                            if gx is not None and gy is not None:
-                                self._add_aruco_obstacle(gx, gy, tid, method='post-spin-add')
-                        self._flush_log(force=False)
-                    except Exception:
-                        pass
-                    self.replan(initial=True)
-                    self.pick_next_goal()
-                    self.notification = 'Step1 complete: proceeding to fixed waypoints'
-                    # fall through to normal logic after this frame
-
-        # -------- End Step 1 logic --------
-
-        # Mapless dynamic ArUCo incorporation: treat newly seen ArUCo IDs as obstacles
-        if self.mapless and tag_count > 0:
-            try:
-                # Do not add ArUCo obstacles while still executing initial marker stage (so we can reach it)
-                if self.initial_marker_stage:
-                    raise Exception("Skip dynamic aruco add during initial_marker_stage")
-                # Attempt to extract global positions if EKF provides them (e.g., ekf.tag_global or fixed_aruco_pos)
-                fxpos = getattr(self.ekf, 'fixed_aruco_pos', None)
-                for t in taglist:
-                    tag_id = None
-                    if isinstance(t, dict):
-                        tag_id = t.get('id', None)
-                    elif isinstance(t, (list, tuple)) and len(t) >= 1:
-                        tag_id = t[0]
-                    if tag_id is None:
-                        continue
-                    tid = int(tag_id)
-                    if tid in self._dynamic_aruco_ids:
-                        continue
-                    # Estimate position: prefer fixed_aruco_pos if it exists and index valid else approximate relative
-                    gx = gy = None
-                    if fxpos is not None and tid < fxpos.shape[0]:
-                        gx = float(fxpos[tid, 0]); gy = float(fxpos[tid, 1])
-                    else:
-                        # Approximate using robot pose + simple bearing assumption (fallback)
-                        rx, ry, rth = self.get_pose()
-                        # Without pixel info, just place a marker 0.5m ahead
-                        gx = rx + 0.5 * math.cos(rth)
-                        gy = ry + 0.5 * math.sin(rth)
-                    if gx is not None and gy is not None:
-                        self._add_aruco_obstacle(gx, gy, tid, method='dynamic-add')
-                        self._flush_log(force=False)
-                        # Replan since obstacle set changed
-                        if self.active:
-                            self.replan(initial=False)
-            except Exception:
-                pass
-
-        # --- Update existing ArUCo obstacle positions if EKF refined them ---
-        # We only rely on EKF fixed_aruco_pos; if those positions shift significantly after first sighting,
-        # update our obstacle list & trigger a replan (rate-limited) so path reflects the refined pose.
-        if self.mapless and not self.initial_marker_stage and self._dynamic_aruco_ids:
-            now_upd = time.time()
+        # 5. Update ArUCo obstacle positions if EKF refined them
+        if self.mapless and self._dynamic_aruco_ids:
+            now_upd = now
             if (now_upd - self._last_aruco_update_check) >= self.aruco_update_check_interval:
                 self._last_aruco_update_check = now_upd
                 fxpos_all = getattr(self.ekf, 'fixed_aruco_pos', None)
@@ -834,7 +643,6 @@ class AutoOperateDynamic(Operate):
                             continue
                         ox, oy = old
                         if math.hypot(newx - ox, newy - oy) > self.aruco_update_tol:
-                            # Update stored position in known_obstacles via index
                             idx = self._aruco_obstacle_indices.get(tid)
                             if idx is not None and 0 <= idx < len(self.known_obstacles):
                                 self.known_obstacles[idx] = [newx, newy]
@@ -844,7 +652,7 @@ class AutoOperateDynamic(Operate):
                 if updated_any and self.active:
                     self.replan(initial=False)
 
-        # Log pose at ~5 Hz and flush log periodically
+        # 6. Logging + simple scan fallback if very few tags (optional; keep for robustness)
         if (now - self._last_pose_log) >= 0.2:
             self._log_pose(now)
             self._last_pose_log = now
@@ -853,36 +661,33 @@ class AutoOperateDynamic(Operate):
             if self._scan_start is None:
                 self._scan_start = now
                 self._scan_dir = 1
-            # Rotate only (no creeping forward)
             elapsed = now - self._scan_start
-            # Alternate scan direction every ~2s
             self._scan_dir = 1 if int(elapsed // 2) % 2 == 0 else -1
             self.command['motion'] = [0, self._scan_dir * self.turn_cmd]
             self.notification = 'Looking for markers: scanning'
             return
         else:
-            # Reset scanning state when we have enough tags
             self._scan_start = None
             self._creep_until = None
 
-        # (Reverse behavior removed) If we were previously reversing, clear state (safety)
+        # 7. Clear any reverse state (feature removed)
         if self._reverse_until is not None:
             self._reverse_until = None
             self._pending_complete_after_reverse = False
 
-        # Ensure we have a plan from current pose to remaining targets
+        # 8. Ensure plan exists
         if (not self._planned_once and self.active) or (self.active and not self.waypoints):
             self.replan(initial=not self._planned_once)
             self._planned_once = True
 
-        # Get/set goal
+        # 9. Acquire current goal
         if self.current_goal is None and self.active:
             self.pick_next_goal()
         if not self.current_goal:
             self.command['motion'] = [0, 0]
             return
 
-        # Control to goal
+        # 10. Motion control toward goal
         x, y, th = self.get_pose()
         gx, gy = self.current_goal
         dx, dy = gx - x, gy - y
@@ -890,30 +695,26 @@ class AutoOperateDynamic(Operate):
         bearing = math.atan2(dy, dx)
         dheading = angle_diff(bearing, th)
 
-        # Arrival handling: if this goal is near the current target, hold then spin-in-place
         if dist <= self.dist_tol:
             if self._is_close_to_current_target([gx, gy]):
-                now_arr = time.time()
+                now_arr = now
                 if self.reached_time is None:
                     self.reached_time = now_arr
                     self._post_hold_spin_start = None
                     self.notification = f'Reached target [{gx:.2f}, {gy:.2f}]. Holding...'
                 hold_elapsed = now_arr - self.reached_time
                 if hold_elapsed < self.hold_duration:
-                    # Still in hold phase
                     self.command['motion'] = [0, 0]
                     return
-                # Start or continue spin phase
                 if self._post_hold_spin_start is None:
                     self._post_hold_spin_start = now_arr
                 spin_elapsed = now_arr - self._post_hold_spin_start
                 if spin_elapsed < self.post_hold_spin_duration:
-                    # Spin in place (can be constant or pulsed; constant here)
                     self.command['motion'] = [0, self.turn_cmd]
                     self.notification = (f'Spinning at target ({spin_elapsed:.1f}s/'
                                          f'{self.post_hold_spin_duration:.0f}s)')
                     return
-                # Spin complete: advance target
+                # Advance
                 self._post_hold_spin_start = None
                 self.command['motion'] = [0, 0]
                 self._advance_target()
@@ -921,14 +722,11 @@ class AutoOperateDynamic(Operate):
                 self.pick_next_goal()
                 return
             else:
-                # Waypoint reached but not the main target cluster; move on
                 self.pick_next_goal()
                 return
 
-        # Turn-then-drive (with pulsed motion)
         turning = abs(dheading) > self.angle_tol
         if turning:
-            now = time.time()
             if self._nav_last_mode != 'turn':
                 self._nav_last_mode = 'turn'
                 self._nav_turn_pulse_start = now
@@ -937,13 +735,10 @@ class AutoOperateDynamic(Operate):
             t_period = float(self.nav_turn_pulse_spin_time + self.nav_turn_pulse_stop_time)
             t_phase = (now - self._nav_turn_pulse_start) % t_period
             if t_phase < self.nav_turn_pulse_spin_time:
-                # rotate in place
                 self.command['motion'] = [0, self.turn_cmd if dheading > 0 else -self.turn_cmd]
             else:
-                # pulse stop
                 self.command['motion'] = [0, 0]
         else:
-            now = time.time()
             if self._nav_last_mode != 'drive':
                 self._nav_last_mode = 'drive'
                 self._nav_drive_pulse_start = now
@@ -951,7 +746,6 @@ class AutoOperateDynamic(Operate):
                 self._nav_drive_pulse_start = now
             d_period = float(self.nav_drive_pulse_period)
             d_phase = (now - self._nav_drive_pulse_start) % d_period
-            # drive for (period - stop_time) then hold for stop_time
             if d_phase < (self.nav_drive_pulse_period - self.nav_drive_pulse_stop_time):
                 self.command['motion'] = [self.fwd_cmd, 0]
             else:
@@ -1114,11 +908,7 @@ class AutoOperateDynamic(Operate):
                 if math.hypot(ox - tx0, oy - ty0) <= 0.10:
                     continue
 
-            # Treat ArUCo markers as obstacles too (after initial marker stage). During the
-            # initial_marker_stage we still skip them so the robot can intentionally drive to
-            # the first marker without the planner avoiding it.
-            if (label.startswith('aruco') or label.startswith('aruco_')) and self.initial_marker_stage:
-                continue
+            # Treat ArUCo markers as obstacles immediately (no initial gating)
 
             # --- Fruit position refinement (independent of obstacle logic) ---
             # If this detection corresponds to a configured fruit label, maintain / refine its position.
@@ -1199,6 +989,36 @@ class AutoOperateDynamic(Operate):
         if new_added and self.ekf_on and self.active:
             self.replan(initial=False)
 
+        # --- ArUCo markers as obstacles (same cycle as fruits) ---
+        # Added here so markers enter the planner pipeline via the same timing as fruit obstacles.
+        try:
+            taglist = getattr(self.ekf, 'taglist', []) or []
+            if self.mapless and taglist:
+                fxpos = getattr(self.ekf, 'fixed_aruco_pos', None)
+                for t in taglist:
+                    tag_id = None
+                    if isinstance(t, dict):
+                        tag_id = t.get('id', None)
+                    elif isinstance(t, (list, tuple)) and len(t) >= 1:
+                        tag_id = t[0]
+                    if tag_id is None:
+                        continue
+                    tid = int(tag_id)
+                    if tid in self._dynamic_aruco_ids:
+                        continue  # already added
+                    # Prefer EKF fixed positions if available
+                    if fxpos is not None and tid < fxpos.shape[0]:
+                        gx = float(fxpos[tid, 0]); gy = float(fxpos[tid, 1])
+                    else:
+                        # Fallback: place small distance ahead of robot heading (approximation)
+                        rx, ry, rth = self.get_pose()
+                        gx = rx + 0.5 * math.cos(rth)
+                        gy = ry + 0.5 * math.sin(rth)
+                    self._add_aruco_obstacle(gx, gy, tid, method='perception')
+                # _add_aruco_obstacle already triggers a replan; no extra call here
+        except Exception:
+            pass
+
     # ----------------- Helper: add ArUCo obstacle (inside class) -----------------
     def _add_aruco_obstacle(self, gx: float, gy: float, tid: int, method: str):
         """Register (or ignore if duplicate) an ArUCo marker as a point obstacle.
@@ -1213,7 +1033,20 @@ class AutoOperateDynamic(Operate):
             self._aruco_obstacle_indices[tid] = len(self.known_obstacles) - 1
             self._aruco_obstacle_positions[tid] = (gx, gy)
             self._log_obstacle(gx, gy, label=f'aruco_{tid}', method=method)
-          
+            # Add inflation ring (explicit additional obstacle points) so planner routes wider around marker
+            try:
+                if getattr(self, 'aruco_inflate_enabled', False):
+                    r = float(getattr(self, 'aruco_inflate_radius', 0.0))
+                    step = int(getattr(self, 'aruco_inflate_step_deg', 0))
+                    if r > 0 and step > 0:
+                        for ang_deg in range(0, 360, step):
+                            ang = math.radians(float(ang_deg))
+                            rx = gx + r * math.cos(ang)
+                            ry = gy + r * math.sin(ang)
+                            self.known_obstacles.append([rx, ry])
+            except Exception:
+                pass
+
             if self.active and self.ekf_on:
                 print("HELLO")
                 self.replan(initial=False)
