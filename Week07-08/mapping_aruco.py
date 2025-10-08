@@ -207,7 +207,7 @@ class AutoOperateDynamic(Operate):
         self.marker_target_xy = None
         self.marker_spin_phase = None   # 'spinning' or None
         self.marker_spin_start_time = 0.0
-        self.marker_spin_duration = 0     # seconds to spin at marker
+        self.marker_spin_duration = 6     # seconds to spin at marker
         # Post-marker fixed waypoint tour
         self.post_marker_waypoints = [
             [0.0, 1.0],
@@ -744,6 +744,7 @@ class AutoOperateDynamic(Operate):
                     self._planned_once = False
                     # After completing the initial spin, add all currently visible ArUCo markers as obstacles
                     try:
+                        print("aoijorj")
                         current_tags = getattr(self.ekf, 'taglist', []) or []
                         fxpos_all = getattr(self.ekf, 'fixed_aruco_pos', None)
                         for t in current_tags:
@@ -1212,8 +1213,10 @@ class AutoOperateDynamic(Operate):
             self._aruco_obstacle_indices[tid] = len(self.known_obstacles) - 1
             self._aruco_obstacle_positions[tid] = (gx, gy)
             self._log_obstacle(gx, gy, label=f'aruco_{tid}', method=method)
+          
             if self.active and self.ekf_on:
-                self.replan(initial=True)
+                print("HELLO")
+                self.replan(initial=False)
         except Exception:
             pass
 
