@@ -1054,9 +1054,7 @@ if __name__ == "__main__":
     parser.add_argument("--list", type=str, default="")
     parser.add_argument("--grid_res", type=float, default=0.02)
     parser.add_argument("--robot_radius", type=float, default=0.10)
-    parser.add_argument("--safety_margin", type=float, default=0.09)
-    # default safety margin raised to 0.5m for stronger avoidance of ArUCo markers
-    # default merge threshold increased to 0.50 (50 cm)
+    parser.add_argument("--safety_margin", type=float, default=0.092)
     parser.add_argument("--merge_threshold", type=float, default=0.75)
     # only count/add obstacles when seen within this distance (meters)
     parser.add_argument("--obs_max_range", type=float, default=0.45)
