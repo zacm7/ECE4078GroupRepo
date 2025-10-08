@@ -185,7 +185,8 @@ class AutoOperateMapless(Operate):
             'poses': [],
             'fruit_clusters': [],
             'plans': [],
-            'events': []
+            'events': [],
+            'point_debug': []  # diagnostic logs for step 2 navigation
         }
         week0708_dir = os.path.join(REPO_ROOT, 'Week07-08')
         log_dir = os.path.join(week0708_dir, 'lab_output')
@@ -205,7 +206,8 @@ class AutoOperateMapless(Operate):
         # rotate in place for self.marker_spin_duration seconds to improve localization.
         self.initial_marker_done = False
         self.marker_detect_radius = 0.35
-        self.marker_spin_duration = 4.0
+        # Spin duration increased so we can complete (approx) a full 360 in one direction
+        self.marker_spin_duration = 10.0
         self._marker_spin_until = None  # type: Optional[float]
         self._marker_spin_dir = 1
         # Marker approach planning parameters
@@ -217,6 +219,263 @@ class AutoOperateMapless(Operate):
         self._marker_replan_pause_until = 0.0
         # Debug: track last printed marker position to avoid spamming terminal
         self._last_marker_print = None  # (x,y) tuple
+        # Track last plan time to avoid excessive replans
+        self.marker_last_plan_time = 0.0
+
+        # ---- Step 2 point goal (after initial marker localization) ----
+        # Fixed target point in world frame we drive to once initial marker spin completes.
+        # Uses dynamic A* with ALL detected fruits (clusters, confirmed or not) and markers as obstacles.
+        self.point_goal_xy: List[float] = [0.0, 1.0]
+        self.point_goal_done: bool = False
+        self.point_last_plan_time: float = 0.0
+        self.point_replan_interval: float = 0.5  # seconds between plans unless obstacle set changed
+        self._last_point_obstacle_sig: Optional[int] = None  # signature hash to detect changes
+
+        # Stage machine: 'marker' -> 'point' -> 'explore'
+        self.stage = 'marker'
+        # Progress tracking for point goal (avoid spinning forever)
+        self.point_last_dist: Optional[float] = None
+        self.point_last_progress_time = 0.0
+        self.point_progress_timeout = 3.0  # seconds without distance improvement triggers creep
+        self.point_progress_min_delta = 0.02  # min improvement considered progress
+        # Adaptive turn sign diagnostics (Step 2)
+        self._last_heading_error_point = None  # type: Optional[float]
+        self._was_turning_point = False  # type: bool
+        self._invert_turn_sign_point = False  # type: bool
+
+    # ----------------- Marker / point helpers -----------------
+    def _get_marker_positions(self) -> List[Tuple[float, float]]:
+        """Return current estimated marker positions from EKF (if available)."""
+        out: List[Tuple[float, float]] = []
+        try:
+            taglist = getattr(self.ekf, 'taglist', []) or []
+            # First try to extract directly
+            for tag in taglist:
+                try:
+                    if isinstance(tag, dict) and 'x' in tag and 'y' in tag:
+                        out.append((float(tag['x']), float(tag['y'])))
+                    elif isinstance(tag, (list, tuple)) and len(tag) >= 3 and isinstance(tag[1], (int, float)) and isinstance(tag[2], (int, float)):
+                        out.append((float(tag[1]), float(tag[2])))
+                except Exception:
+                    continue
+            # If we only had IDs and found none, try markers array
+            if not out and all(isinstance(t, (int, np.integer)) for t in taglist):
+                markers_arr = getattr(self.ekf, 'markers', None)
+                if isinstance(markers_arr, np.ndarray) and markers_arr.ndim == 2 and markers_arr.shape[0] >= 2:
+                    n_cols = markers_arr.shape[1]
+                    for idx in range(n_cols):
+                        try:
+                            tx = float(markers_arr[0, idx])
+                            ty = float(markers_arr[1, idx])
+                            out.append((tx, ty))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        return out
+
+    def _plan_point_goal(self):
+        """Plan path to the fixed point goal using ALL detected fruits + markers as obstacles."""
+        x, y, _ = self.get_pose()
+        robot_xy = [x, y]
+        goal_xy = list(self.point_goal_xy)
+        obstacles_xy: List[List[float]] = []
+        # Add all fruit clusters (treat fruits as obstacles for this specific point navigation)
+        for c in self.fruit_clusters:
+            try:
+                obstacles_xy.append([float(c['x']), float(c['y'])])
+            except Exception:
+                continue
+        # Add discovered non-target obstacles
+        for o in self.discovered_obstacles:
+            try:
+                obstacles_xy.append([float(o['x']), float(o['y'])])
+            except Exception:
+                continue
+        # Add markers as obstacles
+        for mx, my in self._get_marker_positions():
+            obstacles_xy.append([mx, my])
+        # Virtual wall discretization identical to plan_to_goal
+        inner = max(0.0, self.arena_half - self.wall_clearance)
+        if inner > 0.0:
+            step = max(0.02, min(0.10, self.grid_res))
+            xs = np.arange(-inner, inner + step, step)
+            ys = np.arange(-inner, inner + step, step)
+            for xv in xs:
+                obstacles_xy.append([float(xv), float(inner)])
+                obstacles_xy.append([float(xv), float(-inner)])
+            for yv in ys:
+                obstacles_xy.append([float(inner), float(yv)])
+                obstacles_xy.append([float(-inner), float(yv)])
+        try:
+            wps = plan_waypoints(robot_xy, [goal_xy], obstacles_xy,
+                                  grid_res=self.grid_res,
+                                  robot_radius=self.robot_radius,
+                                  safety_margin=self.safety_margin)
+            self.waypoints = wps
+            self.current_goal = None
+            self.point_last_plan_time = time.time()
+            # Build a simple signature for obstacle set to detect changes
+            sig = 0
+            for ox, oy in obstacles_xy:
+                sig ^= hash((round(ox, 2), round(oy, 2)))
+            self._last_point_obstacle_sig = sig
+            self.notification = 'Planned path to point (0,1)'
+            # Log the point-goal plan for visibility (distinguish via tag)
+            try:
+                self._log['plans'].append({'t': self.point_last_plan_time, 'waypoints': wps, 'type': 'point_goal'})
+            except Exception:
+                pass
+        except Exception as e:
+            self.notification = f'Point planning failed: {e}'
+
+    def _step_point_goal(self):
+        """Execute navigation to the fixed point goal; call each cycle until done."""
+        if self.point_goal_done:
+            return
+        rx, ry, rth = self.get_pose()
+        gx, gy = self.point_goal_xy
+        dist_to_goal = math.hypot(gx - rx, gy - ry)
+        # Arrival check
+        if dist_to_goal <= self.dist_tol:
+            self.point_goal_done = True
+            self.waypoints = []
+            self.current_goal = None
+            self.notification = 'Reached point (0,1)'
+            self.stage = 'explore'
+            return
+        # Decide if we need to (re)plan
+        need_plan = False
+        now_t = time.time()
+        # Obstacle signature current
+        obs_sig = 0
+        try:
+            for mx, my in self._get_marker_positions():
+                obs_sig ^= hash((round(mx, 2), round(my, 2)))
+            for c in self.fruit_clusters:
+                obs_sig ^= hash((round(float(c['x']), 2), round(float(c['y']), 2)))
+            for o in self.discovered_obstacles:
+                obs_sig ^= hash((round(float(o['x']), 2), round(float(o['y']), 2)))
+        except Exception:
+            pass
+        if self._last_point_obstacle_sig is None or obs_sig != self._last_point_obstacle_sig:
+            need_plan = True
+        if not self.waypoints or (self.current_goal is None and not self.waypoints):
+            need_plan = True
+        if (now_t - self.point_last_plan_time) >= self.point_replan_interval:
+            need_plan = True
+        if need_plan:
+            self._plan_point_goal()
+        # Ensure current goal set
+        if self.current_goal is None:
+            if self.waypoints:
+                self._pick_next_waypoint()
+                self.current_goal_changed_flag = True
+            else:
+                self.command['motion'] = [0, 0]
+                return
+        if self.current_goal is None:
+            self.command['motion'] = [0, 0]
+            return
+        # Waypoint control with progress watchdog
+        cxg, cyg = self.current_goal
+        dx, dy = cxg - rx, cyg - ry
+        dist_wp = math.hypot(dx, dy)
+        bearing = math.atan2(dy, dx)
+        dheading = angle_diff(bearing, rth)
+
+        # Waypoint reached check
+        if dist_wp <= self.dist_tol:
+            if self.waypoints:
+                self._pick_next_waypoint()
+                self.current_goal_changed_flag = True
+            return
+
+        # Progress tracking (waypoint-centric)
+        now_t2 = time.time()
+        if not hasattr(self, 'point_last_wp_dist') or getattr(self, 'current_goal_changed_flag', False):
+            self.point_last_wp_dist = dist_wp  # type: ignore[attr-defined]
+            self.point_last_progress_time = now_t2
+            self.current_goal_changed_flag = False
+        else:
+            prev_wp_dist = getattr(self, 'point_last_wp_dist', dist_wp)
+            if (prev_wp_dist - dist_wp) >= self.point_progress_min_delta:
+                self.point_last_progress_time = now_t2
+                self.point_last_wp_dist = dist_wp  # type: ignore[attr-defined]
+            elif dist_wp < prev_wp_dist:
+                self.point_last_wp_dist = dist_wp  # type: ignore[attr-defined]
+        no_progress = (now_t2 - self.point_last_progress_time) > self.point_progress_timeout
+        creep_heading_limit = max(self.angle_tol * 2.0, 0.6)
+        force_creep = no_progress and abs(dheading) < creep_heading_limit
+
+        # If moving significantly away from waypoint, trigger replan and cancel creep
+        growing_away = False
+        if hasattr(self, 'point_last_wp_dist'):
+            prev = getattr(self, 'point_last_wp_dist')  # type: ignore[attr-defined]
+            if dist_wp - prev > 0.10:
+                growing_away = True
+                force_creep = False
+                self._plan_point_goal()
+                if self.current_goal is None and self.waypoints:
+                    self._pick_next_waypoint()
+                    self.current_goal_changed_flag = True
+                if self.current_goal is not None:
+                    cxg, cyg = self.current_goal
+                    dx, dy = cxg - rx, cyg - ry
+                    dist_wp = math.hypot(dx, dy)
+                    bearing = math.atan2(dy, dx)
+                    dheading = angle_diff(bearing, rth)
+                    self.point_last_wp_dist = dist_wp  # type: ignore[attr-defined]
+                    self.point_last_progress_time = now_t2
+
+        # Control
+        if abs(dheading) > self.angle_tol and not force_creep:
+            # Adaptive turn sign: if previous turn step increased error, flip sign mapping
+            if self._was_turning_point and self._last_heading_error_point is not None:
+                if abs(dheading) > abs(self._last_heading_error_point) + 1e-3:
+                    # Diverging -> invert mapping assumption
+                    self._invert_turn_sign_point = not self._invert_turn_sign_point
+            # Base sign from error
+            base_sign = 1 if dheading > 0 else -1
+            if self._invert_turn_sign_point:
+                base_sign *= -1
+            self.command['motion'] = [0, base_sign * self.turn_cmd]
+            self.notification = 'Point goal: turning in place'
+            self._was_turning_point = True
+        else:
+            fwd_speed = self.fwd_cmd
+            if force_creep and abs(dheading) > self.angle_tol:
+                fwd_speed = 0.4 * self.fwd_cmd
+            self.command['motion'] = [fwd_speed, 0]
+            self.notification = 'Navigating to point (0,1)'
+            self._was_turning_point = False
+        self._last_heading_error_point = dheading
+
+        # Periodic debug logging
+        now_dbg = time.time()
+        if not hasattr(self, '_last_point_debug'):
+            self._last_point_debug = 0.0  # type: ignore[attr-defined]
+        if (now_dbg - getattr(self, '_last_point_debug')) >= 0.75:  # type: ignore[attr-defined]
+            dbg = {
+                't': now_dbg,
+                'robot': [rx, ry, rth],
+                'goal': [gx, gy],
+                'current_wp': [cxg, cyg],
+                'dist_to_goal': round(dist_to_goal, 3),
+                'dist_to_wp': round(dist_wp, 3),
+                'bearing_wp': round(bearing, 3),
+                'heading': round(rth, 3),
+                'dheading': round(dheading, 3),
+                'force_creep': force_creep,
+                'no_progress': no_progress,
+                'growing_away': growing_away,
+                'cmd': list(self.command['motion'])
+            }
+            try:
+                self._log['point_debug'].append(dbg)
+            except Exception:
+                pass
+            self._last_point_debug = now_dbg  # type: ignore[attr-defined]
 
     # ----------------- Utility / logging -----------------
     def get_pose(self) -> Tuple[float, float, float]:
@@ -427,110 +686,160 @@ class AutoOperateMapless(Operate):
             self.notification = 'All targets collected'
             return
 
-        # ---- Step 1: Navigate to first seen ArUco marker, then spin ----
-        if not self.initial_marker_done:
-            # If currently spinning at the marker, finish spin first
+        # ---- Step 1 (A*): plan to first seen ArUco marker (dynamic replanning) then spin ----
+        if self.stage == 'marker' and not self.initial_marker_done:
+            rx, ry, rth = self.get_pose()
+
+            # If currently spinning at marker, continue until done
             if self._marker_spin_until is not None:
                 if time.time() < self._marker_spin_until:
-                    phase = int((time.time() * 1000) // 1500) % 2
-                    self._marker_spin_dir = 1 if phase == 0 else -1
+                    # Single-direction spin (no alternating) for stable 360 capture
                     self.command['motion'] = [0, self._marker_spin_dir * self.turn_cmd]
                     self.notification = 'Marker spin (localizing)'
                     return
-                else:
-                    # Spin done; resume exploration
-                    self._marker_spin_until = None
-                    self.initial_marker_done = True
-                    self.marker_mode = False
-                    # Clear any residual waypoint plan
-                    self.waypoints = []
-                    self.current_goal = None
+                # Spin finished
+                self._marker_spin_until = None
+                self.initial_marker_done = True
+                self.stage = 'point'
+                # Reset point-stage progress metrics
+                self.point_last_dist = None
+                self.point_last_progress_time = time.time()
+                if hasattr(self, 'point_last_wp_dist'):
+                    delattr(self, 'point_last_wp_dist')
+                self.current_goal_changed_flag = False
+                self.marker_mode = False
+                self.waypoints = []
+                self.current_goal = None
+                # Fall through to exploration this cycle
             if not self.initial_marker_done:
-                # Acquire or update marker goal
                 taglist = getattr(self.ekf, 'taglist', []) or []
-                rx, ry, _ = self.get_pose()
+                # Build a unified list of (id, x, y) candidates
+                marker_candidates: List[Tuple[int, float, float]] = []
+                if taglist:
+                    # Case 1: tag objects already carry pose
+                    for tag in taglist:
+                        try:
+                            if isinstance(tag, dict) and 'x' in tag and 'y' in tag:
+                                tid = int(tag.get('id', tag.get('tag', -1))) if any(k in tag for k in ('id','tag')) else -1
+                                marker_candidates.append((tid, float(tag['x']), float(tag['y'])))
+                            elif isinstance(tag, (list, tuple)):
+                                # common formats: (id, x, y, ...) OR (id, {dict})
+                                if len(tag) >= 3 and isinstance(tag[1], (int, float)) and isinstance(tag[2], (int, float)):
+                                    marker_candidates.append((int(tag[0]), float(tag[1]), float(tag[2])))
+                                elif len(tag) >= 2 and isinstance(tag[1], dict) and 'x' in tag[1] and 'y' in tag[1]:
+                                    dct = tag[1]
+                                    marker_candidates.append((int(tag[0]), float(dct['x']), float(dct['y'])))
+                        except Exception:
+                            continue
+                    # Case 2: taglist appears to just be IDs; pull from ekf.markers matrix
+                    if not marker_candidates and all(isinstance(t, (int, np.integer)) for t in taglist):
+                        markers_arr = getattr(self.ekf, 'markers', None)
+                        try:
+                            if isinstance(markers_arr, np.ndarray) and markers_arr.ndim == 2 and markers_arr.shape[0] >= 2:
+                                # markers_arr expected shape (2, N) where columns align with taglist order
+                                n_cols = markers_arr.shape[1]
+                                for idx, tid in enumerate(taglist):
+                                    if idx < n_cols:
+                                        tx = float(markers_arr[0, idx])
+                                        ty = float(markers_arr[1, idx])
+                                        marker_candidates.append((int(tid), tx, ty))
+                        except Exception:
+                            pass
+
                 best_tag_pos: Optional[Tuple[float, float]] = None
                 best_dist = 1e9
-                for tag in taglist:
-                    tx = ty = None
-                    try:
-                        if isinstance(tag, dict) and 'x' in tag and 'y' in tag:
-                            tx, ty = float(tag['x']), float(tag['y'])
-                        elif isinstance(tag, (list, tuple)) and len(tag) >= 3:
-                            tx, ty = float(tag[1]), float(tag[2])
-                    except Exception:
-                        tx = ty = None
-                    if tx is None or ty is None:
-                        continue
+                for (_tid, tx, ty) in marker_candidates:
                     d = math.hypot(tx - rx, ty - ry)
                     if d < best_dist:
                         best_dist = d
                         best_tag_pos = (tx, ty)
-                if best_tag_pos is not None:
-                    # Debug print of first / updated marker position (once per noticeable change)
-                    if self._last_marker_print is None or math.hypot(best_tag_pos[0]-self._last_marker_print[0], best_tag_pos[1]-self._last_marker_print[1]) > 0.01:
-                        print(f"[MARKER] Selected closest ArUco at approx world (x={best_tag_pos[0]:.3f}, y={best_tag_pos[1]:.3f})")
-                        self._last_marker_print = best_tag_pos
-                    # Decide if we need to (re)plan
-                    need_plan = False
-                    if self.marker_goal is None:
-                        need_plan = True
-                    else:
-                        if math.hypot(best_tag_pos[0] - self.marker_goal[0], best_tag_pos[1] - self.marker_goal[1]) >= self.marker_replan_delta:
-                            need_plan = True
-                    if need_plan:
-                        self.marker_goal = [best_tag_pos[0], best_tag_pos[1]]
-                        # Plan using same planner but only this goal
-                        try:
-                            self.plan_to_goal(self.marker_goal)
-                            self.notification = f'Planning to ArUco @ {self.marker_goal}'
-                            # Brief pause after replan to prevent immediate motion while path updates
-                            self._marker_replan_pause_until = time.time() + 0.10
-                        except Exception:
-                            pass
-                    # Follow plan to marker
-                    if self.current_goal is None:
-                        self._pick_next_waypoint()
-                    if self.current_goal is not None:
-                        # Replan pause: hold still
-                        if time.time() < self._marker_replan_pause_until:
-                            self.command['motion'] = [0, 0]
-                            self.notification = 'Pause after marker replan'
-                            return
-                        # Distance to marker
-                        mx, my = self.marker_goal if self.marker_goal else (best_tag_pos[0], best_tag_pos[1])
-                        dist_marker = math.hypot(mx - rx, my - ry)
-                        # If arrived near marker -> start spin
-                        if dist_marker <= self.marker_arrival_tol:
-                            self._marker_spin_until = time.time() + self.marker_spin_duration
-                            self.command['motion'] = [0, self.turn_cmd]
-                            self.notification = 'Arrived at marker: starting spin'
-                            return
-                        # Else perform regular waypoint control (reuse heading logic below)
-                        gx, gy = self.current_goal
-                        dx, dy = gx - rx, gy - ry
-                        dist_wp = math.hypot(dx, dy)
-                        bearing = math.atan2(dy, dx)
-                        dheading = angle_diff(bearing, _)
-                        if dist_wp <= self.dist_tol:
-                            if self.waypoints:
-                                self._pick_next_waypoint()
-                            return
-                        if abs(dheading) > self.angle_tol:
-                            self.command['motion'] = [0, self.turn_cmd if dheading > 0 else -self.turn_cmd]
-                        else:
-                            self.command['motion'] = [self.fwd_cmd, 0]
-                        self.notification = 'Navigating to first marker'
-                        return
-                # No tag yet: perform slow rotation to search (optional) then fall through to coverage for passive detection
-                if self.marker_goal is None and (len(taglist) == 0):
-                    # light scan pulse
-                    phase = int((time.time() * 1000) // 2000) % 2
+
+                # Debug one-off print if we have raw tag IDs but no positions
+                if taglist and best_tag_pos is None and self._last_marker_print is None:
+                    print('[MARKER DEBUG] taglist detected but no positions could be parsed; check ekf.markers structure')
+                    self._last_marker_print = (0.0, 0.0)
+
+                # No marker yet -> slow rotate to search (avoid drifting)
+                if best_tag_pos is None:
+                    phase = int((time.time() * 1000) // 1800) % 2
                     spin_dir = 1 if phase == 0 else -1
                     self.command['motion'] = [0, spin_dir * self.turn_cmd]
                     self.notification = 'Searching for first marker'
                     return
-            # If we set initial_marker_done this cycle, continue into exploration; else early returned above
+
+                # Decide whether to (re)plan: on first sight, significant movement, or empty plan
+                need_replan = False
+                now_t = time.time()
+                if self.marker_goal is None:
+                    need_replan = True
+                else:
+                    shift = math.hypot(best_tag_pos[0] - self.marker_goal[0], best_tag_pos[1] - self.marker_goal[1])
+                    if shift >= self.marker_replan_delta:
+                        need_replan = True
+                if not self.waypoints or (self.current_goal is None and not self.waypoints):
+                    need_replan = True
+                # Throttle replans to at most 5 Hz
+                if need_replan and (now_t - self.marker_last_plan_time) < 0.2:
+                    need_replan = False
+
+                if need_replan:
+                    self.marker_goal = [best_tag_pos[0], best_tag_pos[1]]
+                    try:
+                        self.plan_to_goal(self.marker_goal)
+                        self.marker_last_plan_time = now_t
+                        self._marker_replan_pause_until = now_t + 0.05
+                        if self._last_marker_print is None or math.hypot(best_tag_pos[0]-self._last_marker_print[0], best_tag_pos[1]-self._last_marker_print[1]) > 0.015:
+                            print(f"[MARKER] Planned to ArUco @ ({self.marker_goal[0]:.3f}, {self.marker_goal[1]:.3f})")
+                            self._last_marker_print = best_tag_pos
+                    except Exception as e:
+                        self.notification = f'Marker planning failed: {e}'
+
+                # After planning ensure we have a current waypoint
+                if self.current_goal is None:
+                    self._pick_next_waypoint()
+
+                # Pause briefly after replan
+                if time.time() < self._marker_replan_pause_until:
+                    self.command['motion'] = [0, 0]
+                    self.notification = 'Pause after marker replan'
+                    return
+
+                # Dynamic arrival check uses latest best_tag_pos (not stale marker_goal)
+                dist_to_marker_now = math.hypot(best_tag_pos[0] - rx, best_tag_pos[1] - ry)
+                if dist_to_marker_now <= self.marker_arrival_tol:
+                    self._marker_spin_dir = 1  # choose direction (set -1 for opposite)
+                    self._marker_spin_until = time.time() + self.marker_spin_duration
+                    self.command['motion'] = [0, self._marker_spin_dir * self.turn_cmd]
+                    self.notification = 'Arrived at marker: spinning (one direction)'
+                    return
+
+                # Standard waypoint following (reuse below logic but early-return here)
+                if self.current_goal is not None:
+                    gx, gy = self.current_goal
+                    dx, dy = gx - rx, gy - ry
+                    dist_wp = math.hypot(dx, dy)
+                    bearing = math.atan2(dy, dx)
+                    dheading = angle_diff(bearing, rth)
+                    if dist_wp <= self.dist_tol:
+                        if self.waypoints:
+                            self._pick_next_waypoint()
+                        return
+                    if abs(dheading) > self.angle_tol:
+                        self.command['motion'] = [0, self.turn_cmd if dheading > 0 else -self.turn_cmd]
+                    else:
+                        self.command['motion'] = [self.fwd_cmd, 0]
+                    self.notification = 'Navigating to first marker'
+                    return
+            # If initial_marker_done was set above, we fall through to exploration
+        # ---- Step 2: Navigate to fixed point (0,1) with dynamic A* (once, before exploration) ----
+        if self.stage in ('point',) and self.initial_marker_done and not self.point_goal_done:
+            self._step_point_goal()
+            # If we're still working on point goal, stop further logic this cycle
+            if not self.point_goal_done:
+                return
+            # After completion we allow exploration / fruit acquisition to proceed
+            if self.point_goal_done:
+                self.stage = 'explore'
 
     # If in exploration mode and we have a confirmed *front* target not yet planned -> plan
         if self.mode == 'explore':
