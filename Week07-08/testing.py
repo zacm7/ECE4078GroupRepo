@@ -5,7 +5,7 @@ import time
 import math
 import json
 from types import SimpleNamespace
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 import numpy as np
 import pygame
@@ -84,14 +84,14 @@ class AutoOperateDynamic(Operate):
         # --- Patrol model (replaces partial map targets) ---
         # Default sequence per requirement: iterate through (0,1) -> (-1,0) -> (0,-1) -> (1,0)
         # Robot assumed to start near (0,0).
-        default_patrol = [(0.0, 1.0), (-1.0, 0.0), (0.0, -1.0), (1.0, 0.0)]
+        default_patrol = [(0.6, 0.6), (-0.6, 0.6), (-0.6, -0.6), (0.6, -0.6)]
         pts: List[Tuple[float, float]] = []
         if patrol_points:
             pts = [(float(a), float(b)) for (a, b) in patrol_points]
         if not pts:
             pts = default_patrol
         # Force first point to (0,1)
-        pts[0] = (0.0, 1.0)
+        pts[0] = (0.6, 0.6)
         # Ensure exactly 4 points (pad/trim)
         while len(pts) < 4:
             pts.append(default_patrol[len(pts) % len(default_patrol)])
@@ -146,6 +146,10 @@ class AutoOperateDynamic(Operate):
         # Arrival spin behavior (replaces previous hold+reverse): spin 8s then advance
         self.arrival_spin_duration = 10.0
         self._arrival_spin_start = None
+        # Pulsed arrival spin (spin/pause cadence similar to other pulsed motions)
+        self.arrival_pulse_spin_time = 0.4   # seconds spinning
+        self.arrival_pulse_stop_time = 0.2   # seconds stopped
+        self._arrival_spin_pulse_start = None
 
         # Detection handling
         self.last_obstacle_add_time = 0.0
@@ -160,12 +164,12 @@ class AutoOperateDynamic(Operate):
         # Fruit obstacle dynamic update tuning
         self.fruit_update_alpha = 0.4          # smoothing factor for position updates
         self.fruit_replan_move_thr = 0.015     # trigger replan if cluster moved more than this (m)
-        self.fruit_stale_time = 90.0           # prune if not seen for this many seconds
+        self.fruit_stale_time = 1090.0           # prune if not seen for this many seconds
         # Kalman-style update parameters for fruit (approximate consistency with EKF landmark refinement)
         self.fruit_Q = np.diag([1e-5, 1e-5])   # process noise (very small, assume static fruit)
         self.fruit_R = np.diag([0.01, 0.01])   # measurement noise (tunable)
         # Arena virtual walls (2.4x2.4m centered at origin) with 10cm keep-out
-        self.arena_half = 1.20
+        self.arena_half = 1.30
         self.wall_clearance = 0.10
 
         # Cache intrinsics (for projection of bbox -> world)
@@ -187,11 +191,13 @@ class AutoOperateDynamic(Operate):
 
         # Navigation pulse timing (normal turn/drive):
         # - Turning: spin 0.4s, stop 0.2s (same as covariance spin)
-        # - Driving forward: period 1.0s with 0.2s stop per second
+        # - Driving forward: now also pulsed explicitly (move then brief stop)
         self.nav_turn_pulse_spin_time = 0.4
-        self.nav_turn_pulse_stop_time = 0.2
-        self.nav_drive_pulse_period = 0.55
-        self.nav_drive_pulse_stop_time = 0.2
+        self.nav_turn_pulse_stop_time = 0.3
+        # Drive pulse: move for nav_drive_pulse_move_time then stop for nav_drive_pulse_stop_time
+        self.nav_drive_pulse_move_time = 0.4  # seconds of forward motion
+        # Make stop duration equal to move duration (user request for symmetry)
+        self.nav_drive_pulse_stop_time = self.nav_drive_pulse_move_time  # seconds of pause
         self._nav_turn_pulse_start = None  # type: ignore[assignment]
         self._nav_drive_pulse_start = None  # type: ignore[assignment]
         self._nav_last_mode = None  # 'turn' | 'drive' | None
@@ -239,38 +245,144 @@ class AutoOperateDynamic(Operate):
         except Exception:
             pass
         # Fruit locations persistence file (for later retrieval / navigation)
-        self._fruit_loc_path = os.path.join(log_dir, 'targets.txt')
+        self._fruit_loc_path = os.path.join(log_dir, 'targets.txt')  # now JSON format
+        # Track how many of each base fruit label we've enumerated (for suffix _0, _1, ...)
+        self._fruit_label_counts = {}
+        # Shopping list (fruits to explicitly visit when discovered between patrol points)
+        self.shopping_list = self._load_shopping_list()
+        # Fruit visit parameters
+        self.fruit_visit_radius = 0.25  # meters (approach within this distance counts as visited)
+        self.fruit_hold_duration = 5.0  # seconds to hold at fruit
+        # Fruit visit state
+        self._fruit_visit_queue = []
+        self._fruit_hold_start = None
+        self._visited_fruits_cycle = set()  # enumerated labels visited in current patrol leg
+        self._pending_patrol_advance = False  # set when we've deferred advancing to next patrol point until fruit visits done
+        self._mode = 'patrol'  # 'patrol' | 'arrival_spin' | 'fruit_nav' | 'fruit_hold'
 
     def _save_fruit_locations(self):
-        """Write current discovered fruit obstacle locations to text file.
+        """Persist fruit obstacle locations as enumerated JSON mapping.
 
-        Format (CSV): label,x,y,var_x,var_y,count,last_seen
-        Only non-aruco labels are written.
+        Output example:
+        {
+            "orange_0": {"x": -3.09, "y": -3.17},
+            "pumpkin_0": {"x": 0.94, "y": 0.87}
+        }
+        Only non-aruco labels are included. Enumeration is based on discovery order.
         """
         try:
-            lines = ["label,x,y,var_x,var_y,count,last_seen"]
-            now = time.time()
+            fruit_map: Dict[str, Dict[str, float]] = {}
+            # We'll reconstruct enumeration each save to stay consistent with current obstacles
+            per_label_counter: Dict[str, int] = {}
             for d in self.discovered_obstacles:
-                label = str(d.get('label', ''))
-                if label.startswith('aruco'):
+                raw_label = str(d.get('label', ''))
+                if raw_label.startswith('aruco'):
                     continue
-                x = float(d.get('x', 0.0))
-                y = float(d.get('y', 0.0))
-                cnt = int(d.get('count', 0))
-                last_seen = float(d.get('last_seen', now))
-                var_x, var_y = 0.0, 0.0
-                try:
-                    P = d.get('P', None)
-                    if isinstance(P, np.ndarray) and P.shape == (2, 2):
-                        var_x = float(P[0, 0])
-                        var_y = float(P[1, 1])
-                except Exception:
-                    pass
-                lines.append(f"{label},{x:.4f},{y:.4f},{var_x:.6f},{var_y:.6f},{cnt},{last_seen:.3f}")
+                base = raw_label
+                # If raw_label already has _<n> suffix from prior enumeration, strip it for stable ordering
+                if '_' in raw_label:
+                    parts = raw_label.rsplit('_', 1)
+                    if len(parts) == 2 and parts[1].isdigit():
+                        base = parts[0]
+                idx = per_label_counter.get(base, 0)
+                per_label_counter[base] = idx + 1
+                enum_label = f"{base}_{idx}"
+                fruit_map[enum_label] = {"x": float(d.get('x', 0.0)), "y": float(d.get('y', 0.0))}
             with open(self._fruit_loc_path, 'w') as f:
-                f.write('\n'.join(lines) + '\n')
+                json.dump(fruit_map, f, indent=4)
         except Exception:
             pass
+
+    def _load_shopping_list(self) -> set[str]:
+        """Load shopping list (base fruit labels) from shopping_list.txt (lowercased).
+        Each non-empty line is treated as a label (before any underscore enumeration).
+        """
+        sl: set[str] = set()
+        try:
+            path = os.path.join(SCRIPT_DIR, 'shopping_list.txt')
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    for line in f:
+                        s = line.strip().lower()
+                        if not s:
+                            continue
+                        # ignore comments
+                        if s.startswith('#'):
+                            continue
+                        # strip enumeration suffix if present in file
+                        if '_' in s and s.rsplit('_', 1)[1].isdigit():
+                            s = s.rsplit('_', 1)[0]
+                        sl.add(s)
+        except Exception:
+            pass
+        return sl
+
+    def _base_label(self, lbl: str) -> str:
+        """Return base part of enumerated label (pear_0 -> pear)."""
+        if '_' in lbl:
+            parts = lbl.rsplit('_', 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                return parts[0]
+        return lbl
+
+    def _prepare_fruit_visit_queue(self):
+        """Build queue of fruits (enumerated labels) to visit after a patrol waypoint spin.
+
+        Only includes fruits whose base label is in the shopping list and not already
+        visited during the current patrol leg. Queue ordered by distance from current pose.
+        """
+        self._fruit_visit_queue = []
+        try:
+            if not self.shopping_list:
+                return
+            x, y, _ = self.get_pose()
+            candidates: List[tuple[float, dict]] = []
+            for d in self.discovered_obstacles:
+                try:
+                    lbl = str(d.get('label', '')).lower()
+                    if lbl.startswith('aruco'):
+                        continue
+                    if lbl in self._visited_fruits_cycle:
+                        continue
+                    base = self._base_label(lbl)
+                    if base not in self.shopping_list:
+                        continue
+                    fx = float(d.get('x', 0.0))
+                    fy = float(d.get('y', 0.0))
+                    dist = math.hypot(fx - x, fy - y)
+                    candidates.append((dist, d))
+                except Exception:
+                    continue
+            if not candidates:
+                return
+            candidates.sort(key=lambda t: t[0])
+            self._fruit_visit_queue = [d for _, d in candidates]
+        except Exception:
+            pass
+
+    def _start_next_fruit_target(self) -> bool:
+        """Begin navigation to next fruit in queue. Returns True if started."""
+        if not self._fruit_visit_queue:
+            return False
+        d = self._fruit_visit_queue[0]
+        try:
+            fx = float(d.get('x', 0.0))
+            fy = float(d.get('y', 0.0))
+        except Exception:
+            return False
+        # Replace remaining_targets with fruit point (do not advance patrol yet)
+        self.remaining_targets = [[fx, fy]]
+        self.remaining_labels = [str(d.get('label', 'fruit'))]
+        self.waypoints = []
+        self.current_goal = None
+        try:
+            self.replan(initial=False)
+        except Exception:
+            pass
+        self.pick_next_goal()
+        self._mode = 'fruit_nav'
+        self.notification = f"Heading to fruit: {self.remaining_labels[0]}"
+        return True
 
     def get_fruit_locations(self) -> List[Tuple[str, float, float]]:
         """Return list of (label, x, y) for currently known fruit obstacles."""
@@ -682,21 +794,95 @@ class AutoOperateDynamic(Operate):
         except Exception:
             pass
 
-        # Arrival spin completion check
+        # Fruit visit state handling (executed before arrival spin completion when active)
+        # If we are navigating specifically to a fruit
+        if self._mode == 'fruit_nav' and self.current_goal is not None:
+            try:
+                fx, fy = self.current_goal
+                rx, ry, _ = self.get_pose()
+                if math.hypot(fx - rx, fy - ry) <= self.fruit_visit_radius:
+                    # Reached fruit: enter hold
+                    if self._fruit_hold_start is None:
+                        self._fruit_hold_start = time.time()
+                        self.notification = f"At fruit {self.remaining_labels[0]} holding"
+                        self.command['motion'] = [0, 0]
+                        self._mode = 'fruit_hold'
+                        return
+            except Exception:
+                pass
+        if self._mode == 'fruit_hold':
+            # Stay still for hold duration, then mark fruit visited and move to next fruit or resume patrol
+            if self._fruit_hold_start is not None:
+                held = time.time() - self._fruit_hold_start
+                remaining_hold = max(0.0, self.fruit_hold_duration - held)
+                self.notification = f"Holding at fruit ({remaining_hold:.1f}s)"
+                self.command['motion'] = [0, 0]
+                if held >= self.fruit_hold_duration:
+                    # Mark visited
+                    try:
+                        if self.remaining_labels:
+                            self._visited_fruits_cycle.add(self.remaining_labels[0].lower())
+                    except Exception:
+                        pass
+                    self._fruit_hold_start = None
+                    # Remove from queue front if matches
+                    if self._fruit_visit_queue:
+                        try:
+                            front_lbl = str(self._fruit_visit_queue[0].get('label','')).lower()
+                            if self.remaining_labels and front_lbl == self.remaining_labels[0].lower():
+                                self._fruit_visit_queue.pop(0)
+                        except Exception:
+                            pass
+                    # Decide next action
+                    if self._fruit_visit_queue:
+                        # Start next fruit
+                        if self._start_next_fruit_target():
+                            return
+                    else:
+                        # Resume patrol advancement after completing fruit visits
+                        self._mode = 'patrol'
+                        # Advance patrol now if we were waiting
+                        if self._pending_patrol_advance:
+                            self._pending_patrol_advance = False
+                            self._advance_target()
+                            self.replan(initial=False)
+                            self.pick_next_goal()
+                    return
+
+        # Arrival spin completion check (patrol mode only)
         now = time.time()
         if self._arrival_spin_start is not None:
-            if (now - self._arrival_spin_start) < self.arrival_spin_duration:
-                # continue spinning in place (one direction)
-                self.command['motion'] = [0, self.turn_cmd]
-                remaining = self.arrival_spin_duration - (now - self._arrival_spin_start)
-                self.notification = f'Spinning at waypoint ({remaining:.1f}s left)'
+            elapsed_arrival = now - self._arrival_spin_start
+            if elapsed_arrival < self.arrival_spin_duration:
+                # Initialize pulse timer
+                if self._arrival_spin_pulse_start is None:
+                    self._arrival_spin_pulse_start = self._arrival_spin_start
+                # Compute phase in arrival spin pulse
+                a_period = float(self.arrival_pulse_spin_time + self.arrival_pulse_stop_time)
+                a_phase = (now - self._arrival_spin_pulse_start) % a_period
+                if a_phase < self.arrival_pulse_spin_time:
+                    self.command['motion'] = [0, self.turn_cmd]
+                else:
+                    self.command['motion'] = [0, 0]
+                remaining = self.arrival_spin_duration - elapsed_arrival
+                self.notification = f'Spinning at waypoint (pulsed) ({remaining:.1f}s left)'
                 return
             else:
-                # Spin finished -> advance to next patrol point
+                # Spin finished -> attempt fruit visits before advancing
                 self._arrival_spin_start = None
-                self._advance_target()
-                self.replan(initial=False)
-                self.pick_next_goal()
+                self._arrival_spin_pulse_start = None
+                # Prepare fruit queue (based on current discoveries & shopping list)
+                self._prepare_fruit_visit_queue()
+                if self._fruit_visit_queue:
+                    self._mode = 'fruit_nav'
+                    self._pending_patrol_advance = True
+                    if self._start_next_fruit_target():
+                        return
+                # If no fruits to visit, advance patrol immediately
+                if not self._fruit_visit_queue:
+                    self._advance_target()
+                    self.replan(initial=False)
+                    self.pick_next_goal()
 
         # Ensure we have a plan from current pose to remaining targets
         if (not self._planned_once and self.active) or (self.active and not self.waypoints):
@@ -755,10 +941,10 @@ class AutoOperateDynamic(Operate):
                 self._nav_drive_pulse_start = now
             if self._nav_drive_pulse_start is None:
                 self._nav_drive_pulse_start = now
-            d_period = float(self.nav_drive_pulse_period)
+            d_period = float(self.nav_drive_pulse_move_time + self.nav_drive_pulse_stop_time)
             d_phase = (now - self._nav_drive_pulse_start) % d_period
-            # drive for (period - stop_time) then hold for stop_time
-            if d_phase < (self.nav_drive_pulse_period - self.nav_drive_pulse_stop_time):
+            # Drive pulse: move then brief stop (similar style to turn pulsing)
+            if d_phase < self.nav_drive_pulse_move_time:
                 self.command['motion'] = [self.fwd_cmd, 0]
             else:
                 self.command['motion'] = [0, 0]
@@ -857,19 +1043,19 @@ class AutoOperateDynamic(Operate):
         fruit_changed = False
 
         # Prune stale fruit obstacles (not updated recently)
-        if self.discovered_obstacles:
-            keep: List[dict] = []
-            pruned = False
-            for d in self.discovered_obstacles:
-                last_seen = float(d.get('last_seen', d.get('t', now)))
-                if (now - last_seen) <= self.fruit_stale_time:
-                    keep.append(d)
-                else:
-                    pruned = True
-            if pruned:
-                self.discovered_obstacles = keep
-                new_added = True
-                fruit_changed = True
+        # if self.discovered_obstacles:
+        #     keep: List[dict] = []
+        #     pruned = False
+        #     for d in self.discovered_obstacles:
+        #         last_seen = float(d.get('last_seen', d.get('t', now)))
+        #         if (now - last_seen) <= self.fruit_stale_time:
+        #             keep.append(d)
+        #         else:
+        #             pruned = True
+        #     if pruned:
+        #         self.discovered_obstacles = keep
+        #         new_added = True
+        #         fruit_changed = True
 
         # Current pose and intrinsics
         x, y, th = self.get_pose()
@@ -957,8 +1143,11 @@ class AutoOperateDynamic(Operate):
             use_merge_thr = self.merge_threshold_non_target if (current_label_merge is None or label != current_label_merge) else self.merge_threshold
 
             for d in self.discovered_obstacles:
-                # only merge identical labels
-                if d.get('label') == label:
+                # only merge identical base labels (strip enumeration suffix if present)
+                existing_label = str(d.get('label', ''))
+                base_existing = existing_label.rsplit('_', 1)[0] if ('_' in existing_label and existing_label.rsplit('_',1)[1].isdigit()) else existing_label
+                base_new = label.rsplit('_', 1)[0] if ('_' in label and label.rsplit('_',1)[1].isdigit()) else label
+                if base_existing == base_new:
                     px, py = float(d['x']), float(d['y'])
                     if math.hypot(ox - px, oy - py) <= use_merge_thr:
                         # Kalman-style update (static model): x' = x, P' = P + Q; z = measurement
@@ -1026,9 +1215,14 @@ class AutoOperateDynamic(Operate):
             if now - self.last_obstacle_add_time < self.add_cooldown:
                 continue
 
+            # Enumerate label
+            base_label = label.rsplit('_',1)[0] if ('_' in label and label.rsplit('_',1)[1].isdigit()) else label
+            idx = int(self._fruit_label_counts.get(base_label, 0))
+            enum_label = f"{base_label}_{idx}"
+            self._fruit_label_counts[base_label] = idx + 1
             # Add obstacle and mark for replanning
-            self.discovered_obstacles.append({'x': float(ox), 'y': float(oy), 'label': label, 'count': 1, 'last_seen': now, 'P': np.diag([0.04, 0.04])})
-            self._log_obstacle(ox, oy, label=label, method=('tpe' if used_tpe else 'heuristic'))
+            self.discovered_obstacles.append({'x': float(ox), 'y': float(oy), 'label': enum_label, 'count': 1, 'last_seen': now, 'P': np.diag([0.04, 0.04])})
+            self._log_obstacle(ox, oy, label=enum_label, method=('tpe' if used_tpe else 'heuristic'))
             self._flush_log(force=False)
             self.last_obstacle_add_time = now
             new_added = True
@@ -1051,8 +1245,8 @@ if __name__ == "__main__":
     parser.add_argument("--map", type=str, default="")
     parser.add_argument("--list", type=str, default="")
     parser.add_argument("--grid_res", type=float, default=0.02)
-    parser.add_argument("--robot_radius", type=float, default=0.10)
-    parser.add_argument("--safety_margin", type=float, default=0.092)
+    parser.add_argument("--robot_radius", type=float, default=0.11)
+    parser.add_argument("--safety_margin", type=float, default=0.098)
     parser.add_argument("--merge_threshold", type=float, default=0.75)
     # only count/add obstacles when seen within this distance (meters)
     parser.add_argument("--obs_max_range", type=float, default=0.45)
