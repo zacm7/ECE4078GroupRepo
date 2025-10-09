@@ -84,14 +84,14 @@ class AutoOperateDynamic(Operate):
         # --- Patrol model (replaces partial map targets) ---
         # Default sequence per requirement: iterate through (0,1) -> (-1,0) -> (0,-1) -> (1,0)
         # Robot assumed to start near (0,0).
-        default_patrol = [(0.6, 0.6), (-0.6, 0.6), (-0.6, -0.6), (0.6, -0.6)]
+        default_patrol = [(0.65, 0.65), (-0.65, 0.65), (-0.65, -0.65), (0.65, -0.65)]
         pts: List[Tuple[float, float]] = []
         if patrol_points:
             pts = [(float(a), float(b)) for (a, b) in patrol_points]
         if not pts:
             pts = default_patrol
         # Force first point to (0,1)
-        pts[0] = (0.6, 0.6)
+        pts[0] = (0.65, 0.65)
         # Ensure exactly 4 points (pad/trim)
         while len(pts) < 4:
             pts.append(default_patrol[len(pts) % len(default_patrol)])
@@ -193,7 +193,7 @@ class AutoOperateDynamic(Operate):
         # - Turning: spin 0.4s, stop 0.2s (same as covariance spin)
         # - Driving forward: now also pulsed explicitly (move then brief stop)
         self.nav_turn_pulse_spin_time = 0.4
-        self.nav_turn_pulse_stop_time = 0.3
+        self.nav_turn_pulse_stop_time = 0.35
         # Drive pulse: move for nav_drive_pulse_move_time then stop for nav_drive_pulse_stop_time
         self.nav_drive_pulse_move_time = 0.4  # seconds of forward motion
         # Make stop duration equal to move duration (user request for symmetry)
