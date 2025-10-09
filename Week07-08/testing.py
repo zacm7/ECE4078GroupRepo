@@ -13,16 +13,15 @@ import pygame
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-WEEK0506_DIR = os.path.join(REPO_ROOT, "Week05-06")
 
-# Import Week05-06 operate.py (GUI + EKF + detector)
-sys.path.insert(0, WEEK0506_DIR)
+# Import local operate.py (now located in the same Week07-08 directory)
 try:
     import operate as operate_mod  # type: ignore
     from operate import Operate    # type: ignore
 except Exception:
+    # Fallback manual loader (should rarely be needed now that file is local)
     import importlib.util
-    _op_file = os.path.join(WEEK0506_DIR, "operate.py")
+    _op_file = os.path.join(SCRIPT_DIR, "operate.py")
     _spec = importlib.util.spec_from_file_location("operate", _op_file)
     operate_mod = importlib.util.module_from_spec(_spec)  # type: ignore
     assert _spec and _spec.loader
@@ -73,11 +72,10 @@ class AutoOperateDynamic(Operate):
         # Always run detector continuously
         self.command['inference'] = True
 
-        # Ensure map outputs (slam.txt, images.txt) go to Week07-08/lab_output explicitly
+        # Ensure map outputs (slam.txt, images.txt) go to local lab_output directory
         try:
-            out_dir = os.path.join(REPO_ROOT, 'Week07-08', 'lab_output')
+            out_dir = os.path.join(SCRIPT_DIR, 'lab_output')
             os.makedirs(out_dir, exist_ok=True)
-            # operate_mod imported earlier; it imported util.DatasetHandler as dh
             if hasattr(operate_mod, 'dh') and hasattr(operate_mod.dh, 'OutputWriter'):
                 self.output = operate_mod.dh.OutputWriter(out_dir)
         except Exception:
@@ -233,9 +231,8 @@ class AutoOperateDynamic(Operate):
         }
         self._last_pose_log = 0.0
         self._last_flush = 0.0
-        # logs go under Week07-08/lab_output regardless of cwd
-        week0708_dir = os.path.join(REPO_ROOT, 'Week07-08')
-        log_dir = os.path.join(week0708_dir, 'lab_output')
+        # logs go under local lab_output regardless of cwd
+        log_dir = os.path.join(SCRIPT_DIR, 'lab_output')
         self._log_path = os.path.join(log_dir, 'auto_nav_log.json')
         try:
             os.makedirs(log_dir, exist_ok=True)
@@ -1047,7 +1044,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser("Autonomous Patrol with Dynamic Obstacles + GUI/SLAM")
     parser.add_argument("--ip", type=str, default="192.168.50.1")
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--calib_dir", type=str, default=os.path.join(REPO_ROOT, "Week02-04", "calibration", "param") + os.sep)
+    # Use local Week07-08 calibration parameters by default now that code is consolidated
+    parser.add_argument("--calib_dir", type=str, default=os.path.join(SCRIPT_DIR, "calibration", "param") + os.sep)
     parser.add_argument("--yolo_model", default=os.path.join(SCRIPT_DIR, "YOLO", "model", "bestv5.pt"))
     # Legacy map/list args retained for compatibility but unused
     parser.add_argument("--map", type=str, default="")
@@ -1062,7 +1060,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_data", action='store_true')
     args, _ = parser.parse_known_args()
 
-    # Provide globals to Week05-06/operate.py expectations
+    # Provide globals to operate.py expectations (previously Week05-06, now local)
     op_args = SimpleNamespace(
         ip=args.ip, port=args.port, calib_dir=args.calib_dir,
         yolo_model=args.yolo_model, play_data=args.play_data, save_data=args.save_data,
@@ -1071,8 +1069,8 @@ if __name__ == "__main__":
 
     # Fonts/icons for Operate GUI
     pygame.font.init()
-    TITLE_FONT = pygame.font.Font(os.path.join(WEEK0506_DIR, 'pics', '8-BitMadness.ttf'), 35)
-    TEXT_FONT = pygame.font.Font(os.path.join(WEEK0506_DIR, 'pics', '8-BitMadness.ttf'), 40)
+    TITLE_FONT = pygame.font.Font(os.path.join(SCRIPT_DIR, 'pics', '8-BitMadness.ttf'), 35)
+    TEXT_FONT = pygame.font.Font(os.path.join(SCRIPT_DIR, 'pics', '8-BitMadness.ttf'), 40)
     operate_mod.TITLE_FONT = TITLE_FONT
     operate_mod.TEXT_FONT = TEXT_FONT
 
@@ -1080,7 +1078,7 @@ if __name__ == "__main__":
     canvas = pygame.display.set_mode((width, height))
     pygame.display.set_caption('ECE4078 - Auto Fruit Search (L3)')
     try:
-        pygame.display.set_icon(pygame.image.load(os.path.join(WEEK0506_DIR, 'pics', '8bit', 'pibot5.png')))
+        pygame.display.set_icon(pygame.image.load(os.path.join(SCRIPT_DIR, 'pics', '8bit', 'pibot5.png')))
     except Exception:
         pass
     canvas.fill((0, 0, 0))
@@ -1106,9 +1104,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
     patrol_pts = _parse_patrol(getattr(args, 'patrol_points', ''))
 
-    # Ensure Week05-06 relative asset paths in operate.py resolve
+    # Ensure relative asset paths in operate.py resolve from current directory (now local)
     try:
-        os.chdir(WEEK0506_DIR)
+        os.chdir(SCRIPT_DIR)
     except Exception:
         pass
 
