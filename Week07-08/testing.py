@@ -148,7 +148,7 @@ class AutoOperateDynamic(Operate):
         self._arrival_spin_start = None
         # Pulsed arrival spin (spin/pause cadence similar to other pulsed motions)
         self.arrival_pulse_spin_time = 0.4   # seconds spinning
-        self.arrival_pulse_stop_time = 0.2   # seconds stopped
+        self.arrival_pulse_stop_time = 0.35   # seconds stopped
         self._arrival_spin_pulse_start = None
 
         # Detection handling
@@ -192,12 +192,12 @@ class AutoOperateDynamic(Operate):
         # Navigation pulse timing (normal turn/drive):
         # - Turning: spin 0.4s, stop 0.2s (same as covariance spin)
         # - Driving forward: now also pulsed explicitly (move then brief stop)
-        self.nav_turn_pulse_spin_time = 0.4
+        self.nav_turn_pulse_spin_time = 0.2
         self.nav_turn_pulse_stop_time = 0.35
         # Drive pulse: move for nav_drive_pulse_move_time then stop for nav_drive_pulse_stop_time
-        self.nav_drive_pulse_move_time = 0.4  # seconds of forward motion
+        self.nav_drive_pulse_move_time = 0.2  # seconds of forward motion
         # Make stop duration equal to move duration (user request for symmetry)
-        self.nav_drive_pulse_stop_time = self.nav_drive_pulse_move_time  # seconds of pause
+        self.nav_drive_pulse_stop_time = 0.50  # seconds of pause
         self._nav_turn_pulse_start = None  # type: ignore[assignment]
         self._nav_drive_pulse_start = None  # type: ignore[assignment]
         self._nav_last_mode = None  # 'turn' | 'drive' | None
@@ -1246,7 +1246,7 @@ if __name__ == "__main__":
     parser.add_argument("--list", type=str, default="")
     parser.add_argument("--grid_res", type=float, default=0.02)
     parser.add_argument("--robot_radius", type=float, default=0.11)
-    parser.add_argument("--safety_margin", type=float, default=0.098)
+    parser.add_argument("--safety_margin", type=float, default=0.099)
     parser.add_argument("--merge_threshold", type=float, default=0.75)
     # only count/add obstacles when seen within this distance (meters)
     parser.add_argument("--obs_max_range", type=float, default=0.45)

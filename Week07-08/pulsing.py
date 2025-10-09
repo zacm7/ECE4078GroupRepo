@@ -120,7 +120,7 @@ class AutoOperateDynamic(Operate):
         self._planned_once = False
 
         # Arrival reverse behavior
-        self.hold_duration = 3.0
+        self.hold_duration = 1.0
         self.reverse_duration = 0.5
         self._reverse_until = None
         self._pending_complete_after_reverse = False
@@ -159,10 +159,10 @@ class AutoOperateDynamic(Operate):
         # Navigation pulse timing (normal turn/drive):
         # - Turning: spin 0.4s, stop 0.2s (same as covariance spin)
         # - Driving forward: period 1.0s with 0.2s stop per second
-        self.nav_turn_pulse_spin_time = 0.4
-        self.nav_turn_pulse_stop_time = 0.2
-        self.nav_drive_pulse_period = 0.55
-        self.nav_drive_pulse_stop_time = 0.2
+        self.nav_turn_pulse_spin_time = 0.3
+        self.nav_turn_pulse_stop_time = 0.45
+        self.nav_drive_pulse_period = 0.35
+        self.nav_drive_pulse_stop_time = 0.45
         self._nav_turn_pulse_start = None  # type: ignore[assignment]
         self._nav_drive_pulse_start = None  # type: ignore[assignment]
         self._nav_last_mode = None  # 'turn' | 'drive' | None
