@@ -84,14 +84,14 @@ class AutoOperateDynamic(Operate):
         # --- Patrol model (replaces partial map targets) ---
         # Default sequence per requirement: iterate through (0,1) -> (-1,0) -> (0,-1) -> (1,0)
         # Robot assumed to start near (0,0).
-        default_patrol = [(0.65, 0.65), (-0.65, 0.65), (-0.65, -0.65), (0.65, -0.65)]
+        default_patrol = [(-0.65, 0.65), (-0.65, -0.65), (0.65, -0.65), (0.65, 0.65)]
         pts: List[Tuple[float, float]] = []
         if patrol_points:
             pts = [(float(a), float(b)) for (a, b) in patrol_points]
         if not pts:
             pts = default_patrol
         # Force first point to (0,1)
-        pts[0] = (0.65, 0.65)
+        pts[0] = (-0.65, 0.65)
         # Ensure exactly 4 points (pad/trim)
         while len(pts) < 4:
             pts.append(default_patrol[len(pts) % len(default_patrol)])
@@ -259,6 +259,15 @@ class AutoOperateDynamic(Operate):
         self._visited_fruits_cycle = set()  # enumerated labels visited in current patrol leg
         self._pending_patrol_advance = False  # set when we've deferred advancing to next patrol point until fruit visits done
         self._mode = 'patrol'  # 'patrol' | 'arrival_spin' | 'fruit_nav' | 'fruit_hold'
+        # Emergency stop (camera-based proximity) parameters
+        self.emergency_enabled = True
+        self.emergency_bbox_width_thresh_px = 150.0  # px width indicating very close object
+        self.emergency_bbox_height_thresh_px = 150.0 # px height indicating very close object
+        self.emergency_center_tolerance_px = 120.0   # px from center in x to accept as frontal
+        self.emergency_dist_m = 0.22                 # estimated distance cutoff (m)
+        self.emergency_hold_time = 1.2               # seconds to stop before resuming
+        self._emergency_until = 0.0
+        self._emergency_replan_triggered = False
 
     def _save_fruit_locations(self):
         """Persist fruit obstacle locations as enumerated JSON mapping.
@@ -754,6 +763,59 @@ class AutoOperateDynamic(Operate):
         if self._calib_mode:
             self._perform_calib_scan_step()
             return
+
+        # --- Emergency stop check (overrides scanning and regular motion) ---
+        try:
+            now = time.time()
+            if self._emergency_until > now:
+                remaining = self._emergency_until - now
+                self.command['motion'] = [0, 0]
+                self.notification = f'Emergency stop: {remaining:.1f}s'
+                return
+            else:
+                self._emergency_replan_triggered = False
+            if self.emergency_enabled:
+                bboxes = getattr(self, 'detector_output', None)
+                if isinstance(bboxes, (list, tuple)):
+                    cx = float(self.cx)
+                    fx = float(self.fx)
+                    for det in bboxes:
+                        try:
+                            label = str(det[0]).lower()
+                            if label.startswith('aruco'):
+                                continue
+                            xywh = np.asarray(det[1]).astype(float)
+                            conf = float(det[2])
+                            if conf < 0.6:
+                                continue
+                            u = float(xywh[0])
+                            w_px = float(xywh[2])
+                            h_px = float(xywh[3])
+                            # Only consider objects roughly in front (near image center)
+                            if abs(u - cx) > self.emergency_center_tolerance_px:
+                                continue
+                            # Trigger if either dimension is large; estimate distance conservatively
+                            if (w_px >= self.emergency_bbox_width_thresh_px) or (h_px >= self.emergency_bbox_height_thresh_px):
+                                W_assumed = 0.10
+                                # Distance from width and height; use smaller (closer) estimate
+                                d_w = (fx * W_assumed) / max(1.0, w_px)
+                                d_h = (fx * W_assumed) / max(1.0, h_px)
+                                d_est = min(d_w, d_h)
+                                if d_est <= self.emergency_dist_m:
+                                    self._emergency_until = now + self.emergency_hold_time
+                                    self.command['motion'] = [0, 0]
+                                    self.notification = 'Emergency stop: obstacle too close'
+                                    if not self._emergency_replan_triggered and self.active:
+                                        try:
+                                            self.replan(initial=False)
+                                        except Exception:
+                                            pass
+                                        self._emergency_replan_triggered = True
+                                    return
+                        except Exception:
+                            continue
+        except Exception:
+            pass
 
         # Marker acquisition gate: scan and occasional creep until >=2 tags visible
         tag_count = len(getattr(self.ekf, 'taglist', []))
