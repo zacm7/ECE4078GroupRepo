@@ -191,7 +191,7 @@ if __name__ == "__main__":
                 rob_x = float(robot_pose[0][0]) if hasattr(robot_pose[0], '__len__') else float(robot_pose[0])
                 rob_y = float(robot_pose[1][0]) if hasattr(robot_pose[1], '__len__') else float(robot_pose[1])
                 dist = np.hypot(est_pose['x'] - rob_x, est_pose['y'] - rob_y)
-                if dist <= 10.0:
+                if dist <= 20.0:
                     target_pose_dict[f'{detection[0]}_{occurrence}'] = est_pose
                     detected_type_list.append(detection[0])
 
