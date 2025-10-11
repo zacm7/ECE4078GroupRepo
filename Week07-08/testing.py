@@ -46,19 +46,7 @@ def angle_diff(a: float, b: float) -> float:
 
 
 class AutoOperateDynamic(Operate):
-    """Autonomous patrol with dynamic obstacle discovery (no prior map).
-
-    Changes vs previous version:
-      * Removed partial map + known fruit locations – everything is built online.
-      * Robot patrols through 4 waypoints in a loop. User will supply the 3 remaining
-        points later; for now only the first point (0,1) is fixed and others can be
-        placeholders. Provide via --patrol_points '0,1;X2,Y2;X3,Y3;X4,Y4'. Blank entries
-        default to simple fillers.
-      * Every detected fruit (YOLO) becomes an obstacle (merged over time) used for A*.
-      * All currently estimated ArUco landmark positions from the EKF become obstacles
-        automatically (no locked positions).
-      * Planning, GUI overlays, motion pulsers, covariance spin, calibration scan retained.
-    """
+        # Autonomous patrol with dynamic obstacle discovery (no prior map).
 
     def __init__(self, args,
                  grid_res: float,
@@ -82,16 +70,13 @@ class AutoOperateDynamic(Operate):
             pass
 
         # --- Patrol model (replaces partial map targets) ---
-        # Default sequence per requirement: iterate through (0,1) -> (-1,0) -> (0,-1) -> (1,0)
-        # Robot assumed to start near (0,0).
+        # Default sequence; robot assumed to start near (0,0).
         default_patrol = [(-0.65, 0.65), (-0.65, -0.65), (0.65, -0.65), (0.65, 0.65)]
         pts: List[Tuple[float, float]] = []
         if patrol_points:
             pts = [(float(a), float(b)) for (a, b) in patrol_points]
         if not pts:
             pts = default_patrol
-        # Force first point to (0,1)
-        pts[0] = (-0.65, 0.65)
         # Ensure exactly 4 points (pad/trim)
         while len(pts) < 4:
             pts.append(default_patrol[len(pts) % len(default_patrol)])
@@ -1352,7 +1337,9 @@ if __name__ == "__main__":
     parser.add_argument("--grid_res", type=float, default=0.02)
     parser.add_argument("--robot_radius", type=float, default=0.11)
     parser.add_argument("--safety_margin", type=float, default=0.099)
-    parser.add_argument("--merge_threshold", type=float, default=0.75)
+    # Merge threshold (main option). You can also use --merge_thresh alias below
+    parser.add_argument("--merge_threshold", type=float, default=0.75,
+                        help="Merge radius (meters) for clustering detections of the same fruit label")
     # only count/add obstacles when seen within this distance (meters)
     parser.add_argument("--obs_max_range", type=float, default=0.45)
     parser.add_argument("--play_data", action='store_true')
@@ -1383,7 +1370,8 @@ if __name__ == "__main__":
     canvas.fill((0, 0, 0))
 
     # Parse patrol points from optional environment/CLI input.
-    # Format: --patrol_points "x1,y1;x2,y2;x3,y3;x4,y4"
+    # Preferred numeric form: --waypoints x1 y1 x2 y2 x3 y3 x4 y4
+    # Back-compat string form: --patrol_points "x1,y1;x2,y2;x3,y3;x4,y4"
     def _parse_patrol(s: str) -> List[Tuple[float, float]]:
         pts: List[Tuple[float, float]] = []
         if not s:
@@ -1398,10 +1386,28 @@ if __name__ == "__main__":
             except Exception:
                 continue
         return pts
-    parser.add_argument("--patrol_points", type=str, default="")
+    # New: numeric waypoints (8 floats)
+    parser.add_argument("--waypoints", nargs=8, type=float, metavar=(
+        "x1", "y1", "x2", "y2", "x3", "y3", "x4", "y4"),
+        help="Four waypoints as 8 numbers: x1 y1 x2 y2 x3 y3 x4 y4")
+    # Back-compat: string waypoints
+    parser.add_argument("--patrol_points", type=str, default="",
+                        help="Four waypoints in 'x1,y1;x2,y2;x3,y3;x4,y4' format")
+    # Alias for merge threshold if you prefer shorter name; maps to same dest
+    parser.add_argument("--merge_thresh", type=float, dest="merge_threshold",
+                        help="Alias for --merge_threshold")
     # Re-parse to include new argument (since we added after initial parse)
     args = parser.parse_args()
-    patrol_pts = _parse_patrol(getattr(args, 'patrol_points', ''))
+    # Build patrol points from preferred --waypoints, otherwise --patrol_points
+    patrol_pts: List[Tuple[float, float]] = []
+    wp_list = getattr(args, 'waypoints', None)
+    if isinstance(wp_list, list) and len(wp_list) == 8:
+        try:
+            patrol_pts = [(float(wp_list[i]), float(wp_list[i+1])) for i in range(0, 8, 2)]
+        except Exception:
+            patrol_pts = []
+    if not patrol_pts:
+        patrol_pts = _parse_patrol(getattr(args, 'patrol_points', ''))
 
     # Ensure relative asset paths in operate.py resolve from current directory (now local)
     try:
