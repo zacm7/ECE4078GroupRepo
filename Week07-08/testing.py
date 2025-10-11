@@ -153,7 +153,7 @@ class AutoOperateDynamic(Operate):
 
         # Detection handling
         self.last_obstacle_add_time = 0.0
-        self.add_cooldown = 0.5  # seconds
+        self.add_cooldown = 0.7  # seconds
         self.min_obs_separation = 0.15  # m
         # Merge detections of the same obstacle label within this radius (m)
         self.merge_threshold = float(merge_threshold)
@@ -164,7 +164,7 @@ class AutoOperateDynamic(Operate):
         # Fruit obstacle dynamic update tuning
         self.fruit_update_alpha = 0.4          # smoothing factor for position updates
         self.fruit_replan_move_thr = 0.015     # trigger replan if cluster moved more than this (m)
-        self.fruit_stale_time = 1090.0           # prune if not seen for this many seconds
+        self.fruit_stale_time = 1800.0           # prune if not seen for this many seconds
         # Kalman-style update parameters for fruit (approximate consistency with EKF landmark refinement)
         self.fruit_Q = np.diag([1e-5, 1e-5])   # process noise (very small, assume static fruit)
         self.fruit_R = np.diag([0.01, 0.01])   # measurement noise (tunable)
@@ -193,14 +193,16 @@ class AutoOperateDynamic(Operate):
         # - Turning: spin 0.4s, stop 0.2s (same as covariance spin)
         # - Driving forward: now also pulsed explicitly (move then brief stop)
         self.nav_turn_pulse_spin_time = 0.2
-        self.nav_turn_pulse_stop_time = 0.35
-        # Drive pulse: move for nav_drive_pulse_move_time then stop for nav_drive_pulse_stop_time
-        self.nav_drive_pulse_move_time = 0.2  # seconds of forward motion
-        # Make stop duration equal to move duration (user request for symmetry)
-        self.nav_drive_pulse_stop_time = 0.50  # seconds of pause
+        self.nav_turn_pulse_stop_time = 0.4
+        # Drive pulse uses the same cadence as turning (spin/stop)
+        # move for nav_turn_pulse_spin_time then stop for nav_turn_pulse_stop_time
+        self.nav_drive_pulse_move_time = 0.2
+        self.nav_drive_pulse_stop_time = 0.4
         self._nav_turn_pulse_start = None  # type: ignore[assignment]
         self._nav_drive_pulse_start = None  # type: ignore[assignment]
         self._nav_last_mode = None  # 'turn' | 'drive' | None
+        # Shared pulse anchor for turn/drive so phase doesn't reset when switching
+        self._nav_pulse_start = None
 
         # Small font used for overlay labels (smaller text)
         # pygame.font.init() is called in __main__ before the operate instance is created,
@@ -251,7 +253,7 @@ class AutoOperateDynamic(Operate):
         # Shopping list (fruits to explicitly visit when discovered between patrol points)
         self.shopping_list = self._load_shopping_list()
         # Fruit visit parameters
-        self.fruit_visit_radius = 0.25  # meters (approach within this distance counts as visited)
+        self.fruit_visit_radius = 0.20  # meters (20cm; approach within this distance counts as visited)
         self.fruit_hold_duration = 5.0  # seconds to hold at fruit
         # Fruit visit state
         self._fruit_visit_queue = []
@@ -259,12 +261,14 @@ class AutoOperateDynamic(Operate):
         self._visited_fruits_cycle = set()  # enumerated labels visited in current patrol leg
         self._pending_patrol_advance = False  # set when we've deferred advancing to next patrol point until fruit visits done
         self._mode = 'patrol'  # 'patrol' | 'arrival_spin' | 'fruit_nav' | 'fruit_hold'
+        # Track the actual fruit target position for proximity checks (avoid using intermediate waypoints)
+        self._fruit_target_xy = None
         # Emergency stop (camera-based proximity) parameters
         self.emergency_enabled = True
         self.emergency_bbox_width_thresh_px = 150.0  # px width indicating very close object
         self.emergency_bbox_height_thresh_px = 150.0 # px height indicating very close object
         self.emergency_center_tolerance_px = 120.0   # px from center in x to accept as frontal
-        self.emergency_dist_m = 0.22                 # estimated distance cutoff (m)
+        self.emergency_dist_m = 0.13                 # estimated distance cutoff (m)
         self.emergency_hold_time = 1.2               # seconds to stop before resuming
         self._emergency_until = 0.0
         self._emergency_replan_triggered = False
@@ -387,6 +391,8 @@ class AutoOperateDynamic(Operate):
         # Replace remaining_targets with fruit point (do not advance patrol yet)
         self.remaining_targets = [[fx, fy]]
         self.remaining_labels = [str(d.get('label', 'fruit'))]
+        # Track the true fruit target position for proximity gating of the hold timer
+        self._fruit_target_xy = (fx, fy)
         self.waypoints = []
         self.current_goal = None
         try:
@@ -891,7 +897,13 @@ class AutoOperateDynamic(Operate):
         # If we are navigating specifically to a fruit
         if self._mode == 'fruit_nav' and self.current_goal is not None:
             try:
-                fx, fy = self.current_goal
+                # Use the actual fruit target position (not intermediate waypoints)
+                if self._fruit_target_xy is not None:
+                    fx, fy = self._fruit_target_xy
+                elif self.remaining_targets:
+                    fx, fy = self.remaining_targets[0]
+                else:
+                    fx, fy = self.current_goal
                 rx, ry, _ = self.get_pose()
                 if math.hypot(fx - rx, fy - ry) <= self.fruit_visit_radius:
                     # Reached fruit: enter hold
@@ -918,6 +930,8 @@ class AutoOperateDynamic(Operate):
                     except Exception:
                         pass
                     self._fruit_hold_start = None
+                    # Clear stored fruit target once visit completes
+                    self._fruit_target_xy = None
                     # Remove from queue front if matches
                     if self._fruit_visit_queue:
                         try:
@@ -1016,11 +1030,10 @@ class AutoOperateDynamic(Operate):
             now = time.time()
             if self._nav_last_mode != 'turn':
                 self._nav_last_mode = 'turn'
-                self._nav_turn_pulse_start = now
-            if self._nav_turn_pulse_start is None:
-                self._nav_turn_pulse_start = now
+            if self._nav_pulse_start is None:
+                self._nav_pulse_start = now
             t_period = float(self.nav_turn_pulse_spin_time + self.nav_turn_pulse_stop_time)
-            t_phase = (now - self._nav_turn_pulse_start) % t_period
+            t_phase = (now - self._nav_pulse_start) % t_period
             if t_phase < self.nav_turn_pulse_spin_time:
                 # rotate in place
                 self.command['motion'] = [0, self.turn_cmd if dheading > 0 else -self.turn_cmd]
@@ -1031,11 +1044,10 @@ class AutoOperateDynamic(Operate):
             now = time.time()
             if self._nav_last_mode != 'drive':
                 self._nav_last_mode = 'drive'
-                self._nav_drive_pulse_start = now
-            if self._nav_drive_pulse_start is None:
-                self._nav_drive_pulse_start = now
+            if self._nav_pulse_start is None:
+                self._nav_pulse_start = now
             d_period = float(self.nav_drive_pulse_move_time + self.nav_drive_pulse_stop_time)
-            d_phase = (now - self._nav_drive_pulse_start) % d_period
+            d_phase = (now - self._nav_pulse_start) % d_period
             # Drive pulse: move then brief stop (similar style to turn pulsing)
             if d_phase < self.nav_drive_pulse_move_time:
                 self.command['motion'] = [self.fwd_cmd, 0]

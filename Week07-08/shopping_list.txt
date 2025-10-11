@@ -1,5 +1,3 @@
-lemon
-garlic
 potato
+garlic
 tomato
-pumpkin
