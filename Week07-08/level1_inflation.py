@@ -92,8 +92,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid_res", type=float, default=0.02)
     parser.add_argument("--robot_radius", type=float, default=0.14)
     parser.add_argument("--safety_margin", type=float, default=0.10)
-    parser.add_argument("--inflate_aruco", action='store_true',
-                        help="Enable adding inflated obstacles around ArUco markers")
+    # ArUco inflation enabled by default. Accept only the exact strings
+    # 'True' or 'False' when specifying the flag value (e.g. --inflate_aruco True).
+    parser.add_argument("--inflate_aruco", type=str, choices=["True", "False"], default="True",
+                        help="Enable adding inflated obstacles around ArUco markers (pass True/False).")
     parser.add_argument("--inflate_aruco_radius", type=float, default=0.12,
                         help="Inflation radius in meters for ArUco markers (only used if --inflate_aruco set)")
     parser.add_argument("--inflate_aruco_points", type=int, default=8,
@@ -104,7 +106,13 @@ def parse_args() -> argparse.Namespace:
                         help="Heading tolerance before engaging forward motion (deg).")
     parser.add_argument("--play_data", action='store_true')
     parser.add_argument("--save_data", action='store_true')
-    return parser.parse_args()
+    args = parser.parse_args()
+    # Convert string 'True'/'False' into a real bool for downstream code
+    try:
+        args.inflate_aruco = True if args.inflate_aruco == "True" else False
+    except Exception:
+        args.inflate_aruco = True
+    return args
 
 
 def prepare_operate(args: argparse.Namespace) -> SimpleNamespace:
