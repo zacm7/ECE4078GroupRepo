@@ -15,6 +15,9 @@ import os
 from types import SimpleNamespace
 from typing import List
 
+import math
+import time
+
 import numpy as np
 import pygame
 
@@ -24,7 +27,7 @@ WEEK0506_DIR = os.path.join(REPO_ROOT, "Week05-06")
 
 # Reuse the advanced autonomous controller from wednesday.py
 import wednesday as wednesday_mod  # type: ignore
-from wednesday import AutoOperateDynamic  # type: ignore
+from wednesday import AutoOperateDynamic, angle_diff  # type: ignore
 
 from map_utils import (
     read_true_map_robust,
@@ -65,10 +68,270 @@ class AutoOperateLevel1(AutoOperateDynamic):
         )
         self.full_ground_truth = full_ground_truth or {}
 
+        # Emergency stop configuration (shared with testing patrol controller)
+        self.emergency_enabled = True
+        self.emergency_bbox_width_thresh_px = 150.0
+        self.emergency_bbox_height_thresh_px = 150.0
+        self.emergency_center_tolerance_px = 120.0
+        self.emergency_dist_m = 0.22
+        self.emergency_hold_time = 1.2
+        self.emergency_reverse_time = 0.5
+        self.emergency_cooldown = 1.0
+        self._emergency_mode: str | None = None
+        self._emergency_until = 0.0
+        self._emergency_replan_triggered = False
+        self._emergency_cooldown_until = 0.0
+
     def periodic_perception_update(self):
         # For Level 1 the full environment is already known, so skip
         # adding obstacles from detector outputs.
         return
+
+    def _get_current_aruco_obstacles(self) -> List[tuple[float, float]]:
+        """Return current EKF landmark positions as obstacle coordinates."""
+        obs: List[tuple[float, float]] = []
+        try:
+            ekf = getattr(self, "ekf", None)
+            if ekf is None:
+                return obs
+            markers = getattr(ekf, "markers", None)
+            if isinstance(markers, np.ndarray) and markers.ndim == 2 and markers.shape[0] >= 2:
+                for i in range(markers.shape[1]):
+                    obs.append((float(markers[0, i]), float(markers[1, i])))
+        except Exception:
+            pass
+        return obs
+
+    def auto_nav_step(self):
+        # Require SLAM to be running
+        if not self.ekf_on:
+            self.command['motion'] = [0, 0]
+            self.notification = 'Press ENTER to start SLAM'
+            return
+
+        # --- High covariance stabilize spin (preempts other actions) ---
+        try:
+            now_cov = time.time()
+            if self._cov_spin_until is not None and now_cov < self._cov_spin_until:
+                if self._cov_spin_start is None:
+                    self._cov_spin_start = now_cov
+                period = float(self.cov_pulse_spin_time + self.cov_pulse_stop_time)
+                phase = (now_cov - self._cov_spin_start) % period
+                if phase < self.cov_pulse_spin_time:
+                    self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
+                    self.notification = 'High covariance: stabilizing spin'
+                else:
+                    self.command['motion'] = [0, 0]
+                    self.notification = 'High covariance: stabilizing spin (pulse stop)'
+                return
+            if self._cov_spin_until is not None and now_cov >= self._cov_spin_until:
+                self._cov_spin_until = None
+                self._cov_spin_start = None
+                self._cov_cooldown_until = now_cov + self.cov_spin_cooldown
+            if now_cov < self._cov_cooldown_until:
+                pass
+            else:
+                P = getattr(self.ekf, 'P', None)
+                if isinstance(P, np.ndarray) and P.shape[0] >= 2 and P.shape[1] >= 2:
+                    pxx = float(P[0, 0])
+                    if pxx > float(self.cov_pos_thresh):
+                        self._cov_spin_dir = -self._cov_spin_dir
+                        self._cov_spin_until = now_cov + float(self.cov_spin_duration)
+                        self._cov_spin_start = now_cov
+                        self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
+                        self.notification = 'High covariance: stabilizing spin'
+                        return
+        except Exception:
+            pass
+
+        # Periodic calibration trigger (non-blocking start)
+        try:
+            if (time.time() - self.last_calib_time) >= self.calib_interval and not self._calib_mode:
+                self.start_calib_scan()
+        except Exception:
+            pass
+
+        # If currently in calibration mode, do calib step and return
+        if self._calib_mode:
+            self._perform_calib_scan_step()
+            return
+
+        # --- Emergency stop check (overrides regular motion) ---
+        try:
+            now = time.time()
+            if self._emergency_mode == 'reverse' and self._emergency_until <= now:
+                self._emergency_mode = 'hold'
+                self._emergency_until = now + float(self.emergency_hold_time)
+                if not self._emergency_replan_triggered and self.active:
+                    try:
+                        self.replan(initial=False)
+                    except Exception:
+                        pass
+                    self._emergency_replan_triggered = True
+            if self._emergency_mode == 'hold' and self._emergency_until <= now:
+                self._emergency_mode = None
+                self._emergency_cooldown_until = now + float(self.emergency_cooldown)
+                self._emergency_until = 0.0
+                self._emergency_replan_triggered = False
+
+            if self._emergency_mode in ('reverse', 'hold') and self._emergency_until > now:
+                remaining = self._emergency_until - now
+                if self._emergency_mode == 'reverse':
+                    self.command['motion'] = [-self.fwd_cmd, 0]
+                    self.notification = f'Emergency: reversing ({remaining:.1f}s)'
+                else:
+                    self.command['motion'] = [0, 0]
+                    self.notification = f'Emergency: holding ({remaining:.1f}s)'
+                return
+
+            if self.emergency_enabled:
+                if now >= self._emergency_cooldown_until:
+                    try:
+                        rx, ry, _ = self.get_pose()
+                        for mx, my in self._get_current_aruco_obstacles():
+                            if math.hypot(float(mx) - rx, float(my) - ry) <= self.emergency_dist_m:
+                                rev = float(self.emergency_reverse_time)
+                                self._emergency_mode = 'reverse'
+                                self._emergency_until = now + rev
+                                self.command['motion'] = [-self.fwd_cmd, 0]
+                                self.notification = 'Emergency: marker too close'
+                                self._emergency_replan_triggered = False
+                                return
+                    except Exception:
+                        pass
+
+                bboxes = getattr(self, 'detector_output', None)
+                if isinstance(bboxes, (list, tuple)):
+                    cx = float(self.cx)
+                    fx = float(self.fx)
+                    for det in bboxes:
+                        try:
+                            label = str(det[0]).lower()
+                            xywh = np.asarray(det[1]).astype(float)
+                            conf = float(det[2])
+                        except Exception:
+                            continue
+                        if conf < 0.6:
+                            continue
+
+                        u = float(xywh[0])
+                        w_px = float(xywh[2])
+                        h_px = float(xywh[3])
+                        if abs(u - cx) > self.emergency_center_tolerance_px:
+                            continue
+                        if now < self._emergency_cooldown_until:
+                            continue
+
+                        if (w_px >= self.emergency_bbox_width_thresh_px) or (h_px >= self.emergency_bbox_height_thresh_px):
+                            W_assumed = 0.10
+                            d_w = (fx * W_assumed) / max(1.0, w_px)
+                            d_h = (fx * W_assumed) / max(1.0, h_px)
+                            d_est = min(d_w, d_h)
+                            if d_est <= self.emergency_dist_m:
+                                rev = float(self.emergency_reverse_time)
+                                self._emergency_mode = 'reverse'
+                                self._emergency_until = now + rev
+                                self.command['motion'] = [-self.fwd_cmd, 0]
+                                self.notification = 'Emergency: reversing'
+                                self._emergency_replan_triggered = False
+                                return
+        except Exception:
+            pass
+
+        # Marker acquisition gate: require at least 2 tags before navigating
+        tag_count = len(getattr(self.ekf, 'taglist', []))
+        now = time.time()
+
+        if (now - self._last_pose_log) >= 0.2:
+            self._log_pose(now)
+            self._last_pose_log = now
+        self._flush_log(force=False)
+        if tag_count < 2:
+            if self._scan_start is None:
+                self._scan_start = now
+                self._scan_dir = 1
+            elapsed = now - self._scan_start
+            self._scan_dir = 1 if int(elapsed // 2) % 2 == 0 else -1
+            self.command['motion'] = [0, self._scan_dir * self.turn_cmd]
+            self.notification = 'Looking for markers: scanning'
+            return
+        else:
+            self._scan_start = None
+            self._creep_until = None
+
+        if self._reverse_until is not None:
+            if now < self._reverse_until:
+                self.command['motion'] = [-self.fwd_cmd, 0]
+                self.notification = 'Reversing from target'
+                return
+            else:
+                self._reverse_until = None
+                if self._pending_complete_after_reverse:
+                    self._pending_complete_after_reverse = False
+                    self._advance_target()
+                    self.replan(initial=False)
+                    self.pick_next_goal()
+
+        if (not self._planned_once and self.active) or (self.active and not self.waypoints):
+            self.replan(initial=not self._planned_once)
+            self._planned_once = True
+
+        if self.current_goal is None and self.active:
+            self.pick_next_goal()
+        if not self.current_goal:
+            self.command['motion'] = [0, 0]
+            return
+
+        x, y, th = self.get_pose()
+        gx, gy = self.current_goal
+        dx, dy = gx - x, gy - y
+        dist = math.hypot(dx, dy)
+        bearing = math.atan2(dy, dx)
+        dheading = angle_diff(bearing, th)
+
+        if dist <= self.dist_tol:
+            if self._is_close_to_current_target([gx, gy]):
+                if self.reached_time is None:
+                    self.reached_time = time.time()
+                    self.notification = f'Reached target [{gx:.2f}, {gy:.2f}]. Holding...'
+                self.command['motion'] = [0, 0]
+                if time.time() - self.reached_time >= self.hold_duration:
+                    self._reverse_until = time.time() + self.reverse_duration
+                    self._pending_complete_after_reverse = True
+                    self.command['motion'] = [-self.fwd_cmd, 0]
+                    self.notification = 'Reversing from target'
+                return
+            else:
+                self.pick_next_goal()
+                return
+
+        turning = abs(dheading) > self.angle_tol
+        if turning:
+            now = time.time()
+            if self._nav_last_mode != 'turn':
+                self._nav_last_mode = 'turn'
+                self._nav_turn_pulse_start = now
+            if self._nav_turn_pulse_start is None:
+                self._nav_turn_pulse_start = now
+            t_period = float(self.nav_turn_pulse_spin_time + self.nav_turn_pulse_stop_time)
+            t_phase = (now - self._nav_turn_pulse_start) % t_period
+            if t_phase < self.nav_turn_pulse_spin_time:
+                self.command['motion'] = [0, self.turn_cmd if dheading > 0 else -self.turn_cmd]
+            else:
+                self.command['motion'] = [0, 0]
+        else:
+            now = time.time()
+            if self._nav_last_mode != 'drive':
+                self._nav_last_mode = 'drive'
+                self._nav_drive_pulse_start = now
+            if self._nav_drive_pulse_start is None:
+                self._nav_drive_pulse_start = now
+            d_period = float(self.nav_drive_pulse_period)
+            d_phase = (now - self._nav_drive_pulse_start) % d_period
+            if d_phase < (self.nav_drive_pulse_period - self.nav_drive_pulse_stop_time):
+                self.command['motion'] = [self.fwd_cmd, 0]
+            else:
+                self.command['motion'] = [0, 0]
 
 
 def parse_args() -> argparse.Namespace:

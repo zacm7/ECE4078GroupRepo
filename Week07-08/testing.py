@@ -804,6 +804,22 @@ class AutoOperateDynamic(Operate):
                     self.notification = f'Emergency: holding ({remaining:.1f}s)'
                 return
             if self.emergency_enabled:
+                # First, use EKF-estimated ArUco poses to detect proximity
+                try:
+                    if now >= self._emergency_cooldown_until:
+                        rx, ry, _ = self.get_pose()
+                        for mx, my in self._get_current_aruco_obstacles():
+                            if math.hypot(float(mx) - rx, float(my) - ry) <= self.emergency_dist_m:
+                                rev = float(self.emergency_reverse_time)
+                                self._emergency_mode = 'reverse'
+                                self._emergency_until = now + rev
+                                self.command['motion'] = [-self.fwd_cmd, 0]
+                                self.notification = 'Emergency: marker too close'
+                                self._emergency_replan_triggered = False
+                                return
+                except Exception:
+                    pass
+
                 bboxes = getattr(self, 'detector_output', None)
                 if isinstance(bboxes, (list, tuple)):
                     cx = float(self.cx)
@@ -811,8 +827,6 @@ class AutoOperateDynamic(Operate):
                     for det in bboxes:
                         try:
                             label = str(det[0]).lower()
-                            if label.startswith('aruco'):
-                                continue
                             xywh = np.asarray(det[1]).astype(float)
                             conf = float(det[2])
                             if conf < 0.6:
