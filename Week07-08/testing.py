@@ -268,6 +268,11 @@ class AutoOperateDynamic(Operate):
         self.emergency_hold_time = 1.2               # seconds to stop before resuming
         self._emergency_until = 0.0
         self._emergency_replan_triggered = False
+        # New: reverse first, then hold + replan, with a brief cooldown to avoid loops
+        self.emergency_reverse_time = 0.5            # seconds to back up when triggered
+        self.emergency_cooldown = 1.0                # seconds after hold to ignore retriggers
+        self._emergency_mode = None                  # None | 'reverse' | 'hold'
+        self._emergency_cooldown_until = 0.0
 
     def _save_fruit_locations(self):
         """Persist fruit obstacle locations as enumerated JSON mapping.
@@ -767,13 +772,37 @@ class AutoOperateDynamic(Operate):
         # --- Emergency stop check (overrides scanning and regular motion) ---
         try:
             now = time.time()
-            if self._emergency_until > now:
-                remaining = self._emergency_until - now
-                self.command['motion'] = [0, 0]
-                self.notification = f'Emergency stop: {remaining:.1f}s'
-                return
-            else:
+            # Emergency state transitions
+            if self._emergency_mode == 'reverse' and self._emergency_until <= now:
+                # Switch to hold phase
+                self._emergency_mode = 'hold'
+                self._emergency_until = now + float(self.emergency_hold_time)
+                # Trigger a replan once when we start holding
+                if not self._emergency_replan_triggered and self.active:
+                    try:
+                        self.replan(initial=False)
+                    except Exception:
+                        pass
+                    self._emergency_replan_triggered = True
+            if self._emergency_mode == 'hold' and self._emergency_until <= now:
+                # Finish emergency entirely and start cooldown
+                self._emergency_mode = None
+                self._emergency_cooldown_until = now + float(self.emergency_cooldown)
+                self._emergency_until = 0.0
                 self._emergency_replan_triggered = False
+
+            # Active emergency phase handling
+            if self._emergency_mode in ('reverse', 'hold') and self._emergency_until > now:
+                remaining = self._emergency_until - now
+                if self._emergency_mode == 'reverse':
+                    # Back up during reverse window
+                    self.command['motion'] = [-self.fwd_cmd, 0]
+                    self.notification = f'Emergency: reversing ({remaining:.1f}s)'
+                else:
+                    # Hold still during hold window
+                    self.command['motion'] = [0, 0]
+                    self.notification = f'Emergency: holding ({remaining:.1f}s)'
+                return
             if self.emergency_enabled:
                 bboxes = getattr(self, 'detector_output', None)
                 if isinstance(bboxes, (list, tuple)):
@@ -794,6 +823,9 @@ class AutoOperateDynamic(Operate):
                             # Only consider objects roughly in front (near image center)
                             if abs(u - cx) > self.emergency_center_tolerance_px:
                                 continue
+                            # Skip triggers during cooldown window
+                            if now < self._emergency_cooldown_until:
+                                continue
                             # Trigger if either dimension is large; estimate distance conservatively
                             if (w_px >= self.emergency_bbox_width_thresh_px) or (h_px >= self.emergency_bbox_height_thresh_px):
                                 W_assumed = 0.10
@@ -802,15 +834,14 @@ class AutoOperateDynamic(Operate):
                                 d_h = (fx * W_assumed) / max(1.0, h_px)
                                 d_est = min(d_w, d_h)
                                 if d_est <= self.emergency_dist_m:
-                                    self._emergency_until = now + self.emergency_hold_time
-                                    self.command['motion'] = [0, 0]
-                                    self.notification = 'Emergency stop: obstacle too close'
-                                    if not self._emergency_replan_triggered and self.active:
-                                        try:
-                                            self.replan(initial=False)
-                                        except Exception:
-                                            pass
-                                        self._emergency_replan_triggered = True
+                                    # Start reverse phase then hold phase
+                                    rev = float(self.emergency_reverse_time)
+                                    self._emergency_mode = 'reverse'
+                                    self._emergency_until = now + rev
+                                    # Immediately set motion to reverse
+                                    self.command['motion'] = [-self.fwd_cmd, 0]
+                                    self.notification = 'Emergency: reversing'
+                                    self._emergency_replan_triggered = False
                                     return
                         except Exception:
                             continue
