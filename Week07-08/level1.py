@@ -73,7 +73,7 @@ class AutoOperateLevel1(AutoOperateDynamic):
         self.emergency_bbox_width_thresh_px = 150.0
         self.emergency_bbox_height_thresh_px = 150.0
         self.emergency_center_tolerance_px = 120.0
-        self.emergency_dist_m = 0.22
+        self.emergency_dist_m = 0.18
         self.emergency_hold_time = 1.2
         self.emergency_reverse_time = 0.5
         self.emergency_cooldown = 1.0
