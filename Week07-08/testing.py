@@ -248,23 +248,29 @@ class AutoOperateDynamic(Operate):
         self._fruit_loc_path = os.path.join(log_dir, 'targets.txt')  # now JSON format
         # Track how many of each base fruit label we've enumerated (for suffix _0, _1, ...)
         self._fruit_label_counts = {}
-        # Shopping list (fruits to explicitly visit when discovered between patrol points)
-        self.shopping_list = self._load_shopping_list()
+        # Shopping list (fruits to explicitly visit when discovered)
+        self.shopping_list_order = self._load_shopping_list()
+        self.shopping_list = set(self.shopping_list_order)
         # Fruit visit parameters
         self.fruit_visit_radius = 0.25  # meters (approach within this distance counts as visited)
-        self.fruit_hold_duration = 5.0  # seconds to hold at fruit
+        self.fruit_hold_duration = 3.0  # seconds to hold at fruit
         # Fruit visit state
         self._fruit_visit_queue = []
         self._fruit_hold_start = None
         self._visited_fruits_cycle = set()  # enumerated labels visited in current patrol leg
         self._pending_patrol_advance = False  # set when we've deferred advancing to next patrol point until fruit visits done
         self._mode = 'patrol'  # 'patrol' | 'arrival_spin' | 'fruit_nav' | 'fruit_hold'
+        self._completed_shopping_labels: set[str] = set()
+        self._shopping_sequence_active = False
+        self._shopping_sequence_pending = False
+        self._mapping_complete = False
+        self._mapping_cycles_completed = 0
         # Emergency stop (camera-based proximity) parameters
         self.emergency_enabled = True
         self.emergency_bbox_width_thresh_px = 150.0  # px width indicating very close object
         self.emergency_bbox_height_thresh_px = 150.0 # px height indicating very close object
         self.emergency_center_tolerance_px = 120.0   # px from center in x to accept as frontal
-        self.emergency_dist_m = 0.10                 # estimated distance cutoff (m)
+        self.emergency_dist_m = 0.22                 # estimated distance cutoff (m)
         self.emergency_hold_time = 1.2               # seconds to stop before resuming
         self._emergency_until = 0.0
         self._emergency_replan_triggered = False
@@ -307,11 +313,11 @@ class AutoOperateDynamic(Operate):
         except Exception:
             pass
 
-    def _load_shopping_list(self) -> set[str]:
+    def _load_shopping_list(self) -> List[str]:
         """Load shopping list (base fruit labels) from shopping_list.txt (lowercased).
-        Each non-empty line is treated as a label (before any underscore enumeration).
+        Order in the file is preserved.
         """
-        sl: set[str] = set()
+        items: List[str] = []
         try:
             path = os.path.join(SCRIPT_DIR, 'shopping_list.txt')
             if os.path.exists(path):
@@ -326,10 +332,10 @@ class AutoOperateDynamic(Operate):
                         # strip enumeration suffix if present in file
                         if '_' in s and s.rsplit('_', 1)[1].isdigit():
                             s = s.rsplit('_', 1)[0]
-                        sl.add(s)
+                        items.append(s)
         except Exception:
             pass
-        return sl
+        return items
 
     def _base_label(self, lbl: str) -> str:
         """Return base part of enumerated label (pear_0 -> pear)."""
@@ -339,7 +345,7 @@ class AutoOperateDynamic(Operate):
                 return parts[0]
         return lbl
 
-    def _prepare_fruit_visit_queue(self):
+    def _prepare_fruit_visit_queue(self, shopping_sequence: bool = False):
         """Build queue of fruits (enumerated labels) to visit after a patrol waypoint spin.
 
         Only includes fruits whose base label is in the shopping list and not already
@@ -347,6 +353,35 @@ class AutoOperateDynamic(Operate):
         """
         self._fruit_visit_queue = []
         try:
+            if shopping_sequence:
+                if not self.shopping_list:
+                    return
+                x, y, _ = self.get_pose()
+                closest_per_label: dict[str, tuple[float, dict]] = {}
+                for d in self.discovered_obstacles:
+                    try:
+                        lbl = str(d.get('label', '')).lower()
+                        if lbl.startswith('aruco'):
+                            continue
+                        base = self._base_label(lbl)
+                        if base not in self.shopping_list:
+                            continue
+                        if base in self._completed_shopping_labels:
+                            continue
+                        fx = float(d.get('x', 0.0))
+                        fy = float(d.get('y', 0.0))
+                        dist = math.hypot(fx - x, fy - y)
+                        prev = closest_per_label.get(base)
+                        if prev is None or dist < prev[0]:
+                            closest_per_label[base] = (dist, d)
+                    except Exception:
+                        continue
+                if not closest_per_label:
+                    return
+                ordered = sorted(closest_per_label.values(), key=lambda t: t[0])
+                self._fruit_visit_queue = [d for _, d in ordered]
+                return
+
             if not self.shopping_list:
                 return
             x, y, _ = self.get_pose()
@@ -373,6 +408,24 @@ class AutoOperateDynamic(Operate):
             self._fruit_visit_queue = [d for _, d in candidates]
         except Exception:
             pass
+
+    def _start_shopping_sequence(self) -> bool:
+        """Switch from patrol mapping to shopping-list execution."""
+        self._prepare_fruit_visit_queue(shopping_sequence=True)
+        if not self._fruit_visit_queue:
+            return False
+        self._visited_fruits_cycle.clear()
+        self._shopping_sequence_active = True
+        self._mode = 'fruit_nav'
+        self._pending_patrol_advance = False
+        self.waypoints = []
+        self.current_goal = None
+        self.remaining_targets = []
+        self.remaining_labels = []
+        started = self._start_next_fruit_target()
+        if started:
+            self.notification = 'Mapping complete: visiting shopping list'
+        return started
 
     def _start_next_fruit_target(self) -> bool:
         """Begin navigation to next fruit in queue. Returns True if started."""
@@ -887,6 +940,10 @@ class AutoOperateDynamic(Operate):
             self._scan_start = None
             self._creep_until = None
 
+        if self._shopping_sequence_pending and not self._shopping_sequence_active:
+            if self._start_shopping_sequence():
+                self._shopping_sequence_pending = False
+
         # If number of EKF landmarks increased (new ArUco(s) localised), force a replan
         try:
             current_marker_count = 0
@@ -912,9 +969,9 @@ class AutoOperateDynamic(Operate):
                     if self._fruit_hold_start is None:
                         self._fruit_hold_start = time.time()
                         self.notification = f"At fruit {self.remaining_labels[0]} holding"
-                        self.command['motion'] = [0, 0]
-                        self._mode = 'fruit_hold'
-                        return
+                    self.command['motion'] = [0, 0]
+                    self._mode = 'fruit_hold'
+                    return
             except Exception:
                 pass
         if self._mode == 'fruit_hold':
@@ -928,7 +985,11 @@ class AutoOperateDynamic(Operate):
                     # Mark visited
                     try:
                         if self.remaining_labels:
-                            self._visited_fruits_cycle.add(self.remaining_labels[0].lower())
+                            lbl_full = self.remaining_labels[0].lower()
+                            self._visited_fruits_cycle.add(lbl_full)
+                            base_lbl = self._base_label(lbl_full)
+                            if self._shopping_sequence_active:
+                                self._completed_shopping_labels.add(base_lbl)
                     except Exception:
                         pass
                     self._fruit_hold_start = None
@@ -946,14 +1007,21 @@ class AutoOperateDynamic(Operate):
                         if self._start_next_fruit_target():
                             return
                     else:
+                        if self._shopping_sequence_active:
+                            self._shopping_sequence_active = False
+                            self.active = False
+                            self.command['motion'] = [0, 0]
+                            self.notification = 'Shopping list completed'
+                            return
                         # Resume patrol advancement after completing fruit visits
                         self._mode = 'patrol'
                         # Advance patrol now if we were waiting
                         if self._pending_patrol_advance:
                             self._pending_patrol_advance = False
-                            self._advance_target()
-                            self.replan(initial=False)
-                            self.pick_next_goal()
+                            if not (self._shopping_sequence_pending or self._shopping_sequence_active):
+                                self._advance_target()
+                                self.replan(initial=False)
+                                self.pick_next_goal()
                     return
 
         # Arrival spin completion check (patrol mode only)
@@ -987,6 +1055,8 @@ class AutoOperateDynamic(Operate):
                         return
                 # If no fruits to visit, advance patrol immediately
                 if not self._fruit_visit_queue:
+                    if self._shopping_sequence_pending or self._shopping_sequence_active:
+                        return
                     self._advance_target()
                     self.replan(initial=False)
                     self.pick_next_goal()
@@ -1100,7 +1170,18 @@ class AutoOperateDynamic(Operate):
     def _advance_target(self):
         if not hasattr(self, 'patrol_points') or len(self.patrol_points) == 0:
             return
-        self.patrol_index = (self.patrol_index + 1) % len(self.patrol_points)
+        next_index = (self.patrol_index + 1) % len(self.patrol_points)
+        if not self._mapping_complete and next_index == 0:
+            self._mapping_cycles_completed += 1
+            if self._mapping_cycles_completed >= 1:
+                self._mapping_complete = True
+                self._shopping_sequence_pending = True
+                self.waypoints = []
+                self.current_goal = None
+                self.remaining_targets = []
+                self.remaining_labels = []
+                return
+        self.patrol_index = next_index
         self.remaining_targets = [list(self.patrol_points[self.patrol_index])]
         self.remaining_labels = [self.search_list[self.patrol_index]]
         self.reached_time = None
