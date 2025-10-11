@@ -264,7 +264,7 @@ class AutoOperateDynamic(Operate):
         self.emergency_bbox_width_thresh_px = 150.0  # px width indicating very close object
         self.emergency_bbox_height_thresh_px = 150.0 # px height indicating very close object
         self.emergency_center_tolerance_px = 120.0   # px from center in x to accept as frontal
-        self.emergency_dist_m = 0.22                 # estimated distance cutoff (m)
+        self.emergency_dist_m = 0.10                 # estimated distance cutoff (m)
         self.emergency_hold_time = 1.2               # seconds to stop before resuming
         self._emergency_until = 0.0
         self._emergency_replan_triggered = False

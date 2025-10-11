@@ -353,7 +353,7 @@ def parse_args() -> argparse.Namespace:
                         help="Shopping list of target fruits (one per line).")
     parser.add_argument("--grid_res", type=float, default=0.02)
     parser.add_argument("--robot_radius", type=float, default=0.14)
-    parser.add_argument("--safety_margin", type=float, default=0.18)
+    parser.add_argument("--safety_margin", type=float, default=0.10)
     parser.add_argument("--dist_tol", type=float, default=0.15,
                         help="Distance tolerance when declaring waypoint reached (m).")
     parser.add_argument("--angle_tol_deg", type=float, default=10.0,
