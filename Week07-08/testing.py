@@ -125,7 +125,7 @@ class AutoOperateDynamic(Operate):
         # Track marker count to trigger replans when new ArUcos are added
         self._last_marker_count = 0
         # Initial startup spin (environment survey) configuration
-        self._initial_spin_duration = 8.0  # seconds (user request)
+        self._initial_spin_duration = 10.0  # seconds (user request)
         self._initial_spin_start = time.time()
 
         # Arrival spin behavior (replaces previous hold+reverse): spin 8s then advance
@@ -697,8 +697,13 @@ class AutoOperateDynamic(Operate):
         if getattr(self, '_initial_spin_start', None) is not None:
             elapsed_init = time.time() - self._initial_spin_start
             if elapsed_init < self._initial_spin_duration:
-                # Constant rotation to gather landmarks / detections
-                self.command['motion'] = [0, self.turn_cmd]
+                # Pulsed rotation to gather landmarks / detections
+                period = float(self.nav_turn_pulse_spin_time + self.nav_turn_pulse_stop_time)
+                phase = (time.time() - self._initial_spin_start) % period
+                if phase < self.nav_turn_pulse_spin_time:
+                    self.command['motion'] = [0, self.turn_cmd]
+                else:
+                    self.command['motion'] = [0, 0]
                 remaining = self._initial_spin_duration - elapsed_init
                 self.notification = f'Initial spin: {remaining:.1f}s left'
                 return
