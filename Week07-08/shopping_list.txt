@@ -1,4 +1,4 @@
-lemon
+capsicum
 garlic
 potato
 tomato
