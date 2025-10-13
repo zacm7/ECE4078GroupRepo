@@ -283,6 +283,9 @@ class AutoOperateDynamic(Operate):
         # In addition to event-driven replans, refresh the plan at a fixed cadence
         self._periodic_replan_interval = 18  # seconds
         self._last_periodic_replan = time.time()
+    # Plan-failure watchdog: if planning fails continuously for this long, trigger a cov spin
+        self._plan_fail_start = None  # type: ignore[assignment]
+        self._plan_fail_threshold = 10.0  # seconds
 
     def _save_fruit_locations(self):
         """Persist fruit obstacle locations as enumerated JSON mapping.
@@ -1352,8 +1355,24 @@ class AutoOperateDynamic(Operate):
             self.notification = f'{msg_prefix} {len(self.waypoints)} waypoints (patrol)'
             self._log_plan()
             self._flush_log(force=False)
+            # Reset the plan-failure watchdog on success
+            self._plan_fail_start = None
         except Exception as e:
             self.notification = f'Planning failed: {e}'
+            # Start or update the plan-failure watchdog
+            now_fail = time.time()
+            if self._plan_fail_start is None:
+                self._plan_fail_start = now_fail
+            # If we've been failing to plan for long enough, trigger a covariance spin once
+            elif (now_fail - self._plan_fail_start) >= float(self._plan_fail_threshold):
+                # Only if not already spinning/calibrating/holding/emergency
+                if (self._cov_spin_until is None) and (not self._calib_mode) and (self._emergency_mode is None) and (self._mode != 'fruit_hold'):
+                    self._cov_spin_dir = -self._cov_spin_dir  # alternate direction
+                    self._cov_spin_until = now_fail + float(self.cov_spin_duration)
+                    self._cov_spin_start = now_fail
+                    self.notification = 'Planning failed for 10s: starting stabilizing spin'
+                # Reset timer so we don't retrigger continuously
+                self._plan_fail_start = None
 
     def _advance_target(self):
         if not hasattr(self, 'patrol_points') or len(self.patrol_points) == 0:
