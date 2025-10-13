@@ -1630,7 +1630,7 @@ if __name__ == "__main__":
     parser.add_argument("--list", type=str, default="")
     parser.add_argument("--grid_res", type=float, default=0.02)
     parser.add_argument("--robot_radius", type=float, default=0.11)
-    parser.add_argument("--safety_margin", type=float, default=0.095)
+    parser.add_argument("--safety_margin", type=float, default=0.099)
     # Merge threshold (main option). You can also use --merge_thresh alias below
     parser.add_argument("--merge_threshold", type=float, default=0.55,
                         help="Merge radius (meters) for clustering detections of the same fruit label")
