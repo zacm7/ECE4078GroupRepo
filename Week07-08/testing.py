@@ -147,7 +147,7 @@ class AutoOperateDynamic(Operate):
         # Only consider detections as obstacles if within this distance (m) from the robot
         self.obs_max_range = float(obs_max_range)
         # Fruit obstacle dynamic update tuning
-        self.fruit_update_alpha = 0.25          # smoothing factor for position updates
+        self.fruit_update_alpha = 0.5          # smoothing factor for position updates
         self.fruit_replan_move_thr = 0.015     # trigger replan if cluster moved more than this (m)
         self.fruit_stale_time = 1800.0           # prune if not seen for this many seconds
         # Kalman-style update parameters for fruit (approximate consistency with EKF landmark refinement)
@@ -281,7 +281,7 @@ class AutoOperateDynamic(Operate):
 
         # Periodic replan settings
         # In addition to event-driven replans, refresh the plan at a fixed cadence
-        self._periodic_replan_interval = 20  # seconds
+        self._periodic_replan_interval = 18  # seconds
         self._last_periodic_replan = time.time()
 
     def _save_fruit_locations(self):
@@ -1611,9 +1611,9 @@ if __name__ == "__main__":
     parser.add_argument("--list", type=str, default="")
     parser.add_argument("--grid_res", type=float, default=0.02)
     parser.add_argument("--robot_radius", type=float, default=0.11)
-    parser.add_argument("--safety_margin", type=float, default=0.092)
+    parser.add_argument("--safety_margin", type=float, default=0.095)
     # Merge threshold (main option). You can also use --merge_thresh alias below
-    parser.add_argument("--merge_threshold", type=float, default=0.40,
+    parser.add_argument("--merge_threshold", type=float, default=0.55,
                         help="Merge radius (meters) for clustering detections of the same fruit label")
     # only count/add obstacles when seen within this distance (meters)
     parser.add_argument("--obs_max_range", type=float, default=0.55)
