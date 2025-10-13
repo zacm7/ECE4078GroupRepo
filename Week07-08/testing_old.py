@@ -148,7 +148,7 @@ class AutoOperateDynamic(Operate):
         self.obs_max_range = float(obs_max_range)
         # Fruit obstacle dynamic update tuning
         self.fruit_update_alpha = 0.5          # smoothing factor for position updates
-        self.fruit_replan_move_thr = 0.1     # trigger replan if cluster moved more than this (m)
+        self.fruit_replan_move_thr = 0.015     # trigger replan if cluster moved more than this (m)
         self.fruit_stale_time = 1800.0           # prune if not seen for this many seconds
         # Kalman-style update parameters for fruit (approximate consistency with EKF landmark refinement)
         self.fruit_Q = np.diag([1e-5, 1e-5])   # process noise (very small, assume static fruit)
@@ -164,7 +164,7 @@ class AutoOperateDynamic(Operate):
 
         # Covariance-based stabilize spin parameters
         self.cov_pos_thresh = 0.14      # trigger threshold on P[0,0]
-        self.cov_spin_duration = 13.0      # seconds to spin when triggered (increased from 6s)
+        self.cov_spin_duration = 9.0      # seconds to spin when triggered (increased from 6s)
         self.cov_spin_cooldown = 3.0      # seconds to wait before checking again
         self._cov_spin_until = None       # type: ignore[assignment]
         self._cov_cooldown_until = 0.0
@@ -259,7 +259,7 @@ class AutoOperateDynamic(Operate):
     # Track the base label of the current fruit target (for dynamic updates)
         self._fruit_target_label_base = None
         self._fruit_target_last_update = 0.0
-        self._fruit_target_replan_cooldown = 0.5  # seconds
+        self._fruit_target_replan_cooldown = 0.2  # seconds
         # Save patrol state when taking a detour so we can resume afterwards
         self._saved_patrol_state = None  # type: ignore[assignment]
     # Track whether we're on an opportunistic detour vs queued fruit visit
@@ -281,7 +281,7 @@ class AutoOperateDynamic(Operate):
 
         # Periodic replan settings
         # In addition to event-driven replans, refresh the plan at a fixed cadence
-        self._periodic_replan_interval = 30  # seconds
+        self._periodic_replan_interval = 18  # seconds
         self._last_periodic_replan = time.time()
     # Plan-failure watchdog: if planning fails continuously for this long, trigger a cov spin
         self._plan_fail_start = None  # type: ignore[assignment]
@@ -674,7 +674,7 @@ class AutoOperateDynamic(Operate):
                 P = getattr(self.ekf, 'P', None)
                 if isinstance(P, np.ndarray) and P.shape[0] >= 2 and P.shape[1] >= 2:
                     Pxy = P[0:2, 0:2]
-                    
+                    print("Robot position covariance (P[0:2,0:2]):\n", Pxy)
             except Exception:
                 pass
         except Exception:
@@ -835,12 +835,6 @@ class AutoOperateDynamic(Operate):
         # --- High covariance stabilize spin (preempts other actions) ---
         try:
             now_cov = time.time()
-            # Do not allow covariance spin to interrupt a fruit hold; cancel any active spin
-            if self._mode == 'fruit_hold':
-                if self._cov_spin_until is not None:
-                    self._cov_spin_until = None
-                    self._cov_spin_start = None
-            
             # If currently spinning due to high covariance, keep spinning until timeout
             if self._cov_spin_until is not None and now_cov < self._cov_spin_until:
                 # Pulsed behavior: rotate for cov_pulse_spin_time then stop for cov_pulse_stop_time
@@ -864,11 +858,11 @@ class AutoOperateDynamic(Operate):
             if now_cov < self._cov_cooldown_until:
                 pass  # proceed with normal behavior
             else:
-                # Check EKF position covariance P[0,0] (but don't start spin during fruit hold)
+                # Check EKF position covariance P[0,0]
                 P = getattr(self.ekf, 'P', None)
                 if isinstance(P, np.ndarray) and P.shape[0] >= 2 and P.shape[1] >= 2:
                     pxx = float(P[0, 0])
-                    if (self._mode != 'fruit_hold') and (pxx > float(self.cov_pos_thresh)):
+                    if pxx > float(self.cov_pos_thresh):
                         # trigger spin
                         self._cov_spin_dir = -self._cov_spin_dir  # alternate direction
                         self._cov_spin_until = now_cov + float(self.cov_spin_duration)
@@ -977,14 +971,7 @@ class AutoOperateDynamic(Operate):
                                     # Immediately set motion to reverse
                                     self.command['motion'] = [-self.fwd_cmd, 0]
                                     self.notification = 'Emergency: reversing'
-                                    # Replan immediately on emergency trigger so a fresh path is ready
-                                    try:
-                                        if self.active:
-                                            self.replan(initial=False)
-                                    except Exception:
-                                        pass
-                                    # Mark as triggered to avoid duplicate replan at reverse→hold transition
-                                    self._emergency_replan_triggered = True
+                                    self._emergency_replan_triggered = False
                                     return
                         except Exception:
                             continue
@@ -1344,30 +1331,8 @@ class AutoOperateDynamic(Operate):
         x, y, _ = self.get_pose()
         robot_xy = [x, y]
         obstacles_xy: List[List[float]] = []
-        # Base obstacle set: ArUcos + discovered fruits
-        aruco_obs = [[ox, oy] for (ox, oy) in self._get_current_aruco_obstacles()]
-        disc_obs = [[float(d['x']), float(d['y'])] for d in self.discovered_obstacles]
-        # If we're actively navigating to a fruit, exclude obstacles very close to the fruit target
-        # to avoid the "goal is an obstacle" deadlock that causes planning to fail.
-        target_xy = None
-        try:
-            if self._mode in ('fruit_nav', 'fruit_hold') and self._fruit_target_xy is not None:
-                target_xy = (float(self._fruit_target_xy[0]), float(self._fruit_target_xy[1]))
-        except Exception:
-            target_xy = None
-        if target_xy is not None:
-            tx, ty = target_xy
-            # Skip radius: slightly larger than inflated robot radius
-            skip_r = max(self.grid_res * 2.0, float(self.robot_radius) + float(self.safety_margin) + 0.02)
-            for ox, oy in aruco_obs:
-                obstacles_xy.append([ox, oy])
-            for ox, oy in disc_obs:
-                if math.hypot(ox - tx, oy - ty) <= skip_r:
-                    continue
-                obstacles_xy.append([ox, oy])
-        else:
-            obstacles_xy.extend(aruco_obs)
-            obstacles_xy.extend(disc_obs)
+        obstacles_xy.extend([[ox, oy] for (ox, oy) in self._get_current_aruco_obstacles()])
+        obstacles_xy.extend([[float(d['x']), float(d['y'])] for d in self.discovered_obstacles])
         inner = max(0.0, float(self.arena_half) - float(self.wall_clearance))
         if inner > 0.0:
             step = max(0.02, min(0.10, self.grid_res))
@@ -1664,8 +1629,8 @@ if __name__ == "__main__":
     parser.add_argument("--map", type=str, default="")
     parser.add_argument("--list", type=str, default="")
     parser.add_argument("--grid_res", type=float, default=0.02)
-    parser.add_argument("--robot_radius", type=float, default=0.13)
-    parser.add_argument("--safety_margin", type=float, default=0.099)
+    parser.add_argument("--robot_radius", type=float, default=0.11)
+    parser.add_argument("--safety_margin", type=float, default=0.095)
     # Merge threshold (main option). You can also use --merge_thresh alias below
     parser.add_argument("--merge_threshold", type=float, default=0.55,
                         help="Merge radius (meters) for clustering detections of the same fruit label")
