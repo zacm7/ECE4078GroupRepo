@@ -68,6 +68,28 @@ class AutoOperateLevel1(AutoOperateDynamic):
         )
         self.full_ground_truth = full_ground_truth or {}
 
+        self.target_labels = {s.lower() for s in search_list}
+        self.boundary_radius_map = {
+            'aruco': 0.28,
+            'target': 0.22,
+            'obstacle': 0.20,
+        }
+        self.boundary_items: List[dict[str, float | str]] = []
+        if isinstance(self.full_ground_truth, dict):
+            for name, pose in self.full_ground_truth.items():
+                try:
+                    x_val = float(pose['x'])  # type: ignore[index]
+                    y_val = float(pose['y'])  # type: ignore[index]
+                except (KeyError, TypeError, ValueError):
+                    continue
+                item_key = str(name).lower()
+                if item_key.startswith('aruco'):
+                    kind = 'aruco'
+                else:
+                    base_label = item_key.rsplit('_', 1)[0]
+                    kind = 'target' if base_label in self.target_labels else 'obstacle'
+                self.boundary_items.append({'type': kind, 'x': x_val, 'y': y_val})
+
         # Emergency stop configuration (shared with testing patrol controller)
         self.emergency_enabled = True
         self.emergency_bbox_width_thresh_px = 150.0
@@ -89,6 +111,47 @@ class AutoOperateLevel1(AutoOperateDynamic):
         # For Level 1 the full environment is already known, so skip
         # adding obstacles from detector outputs.
         return
+
+    def draw(self, canvas):
+        super().draw(canvas)
+        try:
+            v_pad = 40
+            h_pad = 20
+            slam_origin = (2 * h_pad + 320, v_pad)
+            view_w = 320
+            view_h = 480 + v_pad
+            m2pixel = 100
+
+            rx, ry, _ = self.get_pose()
+
+            type_colors = {
+                'aruco': (255, 215, 0),
+                'target': (60, 200, 60),
+                'obstacle': (200, 80, 60),
+            }
+
+            for item in self.boundary_items:
+                try:
+                    kind = str(item['type'])
+                    world_x = float(item['x'])
+                    world_y = float(item['y'])
+                    radius_m = float(self.boundary_radius_map.get(kind, 0.20))
+                except Exception:
+                    continue
+
+                rel_x = world_x - rx
+                rel_y = world_y - ry
+                x_im = int(-rel_x * m2pixel + view_w / 2.0)
+                y_im = int(rel_y * m2pixel + view_h / 2.0)
+                canvas_pos = (slam_origin[0] + x_im, slam_origin[1] + y_im)
+
+                radius_px = max(4, int(radius_m * m2pixel))
+                color = type_colors.get(kind, (180, 180, 180))
+
+                pygame.draw.circle(canvas, color, canvas_pos, radius_px, width=2)
+        except Exception:
+            pass
+        return canvas
 
     def _get_current_aruco_obstacles(self) -> List[tuple[float, float]]:
         """Return current EKF landmark positions as obstacle coordinates."""

@@ -9,7 +9,6 @@ from typing import List, Tuple, Dict
 
 import numpy as np
 import pygame
-import matplotlib.pyplot as plt
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -247,7 +246,6 @@ class AutoOperateDynamic(Operate):
             pass
         # Fruit locations persistence file (for later retrieval / navigation)
         self._fruit_loc_path = os.path.join(log_dir, 'targets.txt')  # now JSON format
-        self._truth_map_path = os.path.join(log_dir, 'truth_map.txt')
         # Track how many of each base fruit label we've enumerated (for suffix _0, _1, ...)
         self._fruit_label_counts = {}
         # Shopping list (fruits to explicitly visit when discovered)
@@ -263,8 +261,8 @@ class AutoOperateDynamic(Operate):
         self._pending_patrol_advance = False  # set when we've deferred advancing to next patrol point until fruit visits done
         self._mode = 'patrol'  # 'patrol' | 'arrival_spin' | 'fruit_nav' | 'fruit_hold'
         self._completed_shopping_labels: set[str] = set()
-        self._shopping_sequence_active = False
-        self._shopping_sequence_pending = False
+        self.enable_fruit_visits = True
+        self.enable_opportunistic_detours = True
         self._mapping_complete = False
         self._mapping_cycles_completed = 0
         # Planning failure recovery timer
@@ -284,8 +282,6 @@ class AutoOperateDynamic(Operate):
         self.emergency_cooldown = 1.0                # seconds after hold to ignore retriggers
         self._emergency_mode = None                  # None | 'reverse' | 'hold'
         self._emergency_cooldown_until = 0.0
-        self._emergency_trigger_count = 0
-        self._last_emergency_position = None
 
     def _save_fruit_locations(self):
         """Persist fruit obstacle locations as enumerated JSON mapping.
@@ -317,15 +313,6 @@ class AutoOperateDynamic(Operate):
                 fruit_map[enum_label] = {"x": float(d.get('x', 0.0)), "y": float(d.get('y', 0.0))}
             with open(self._fruit_loc_path, 'w') as f:
                 json.dump(fruit_map, f, indent=4)
-            try:
-                if fruit_map:
-                    with open(self._truth_map_path, 'w') as txt:
-                        for label, pose in fruit_map.items():
-                            txt.write(f"{label} {pose['x']} {pose['y']}\n")
-                else:
-                    open(self._truth_map_path, 'w').close()
-            except Exception:
-                pass
         except Exception:
             pass
 
@@ -412,6 +399,8 @@ class AutoOperateDynamic(Operate):
                     base = self._base_label(lbl)
                     if base not in self.shopping_list:
                         continue
+                    if base in self._completed_shopping_labels:
+                        continue
                     fx = float(d.get('x', 0.0))
                     fy = float(d.get('y', 0.0))
                     dist = math.hypot(fx - x, fy - y)
@@ -424,24 +413,6 @@ class AutoOperateDynamic(Operate):
             self._fruit_visit_queue = [d for _, d in candidates]
         except Exception:
             pass
-
-    def _start_shopping_sequence(self) -> bool:
-        """Switch from patrol mapping to shopping-list execution."""
-        self._prepare_fruit_visit_queue(shopping_sequence=True)
-        if not self._fruit_visit_queue:
-            return False
-        self._visited_fruits_cycle.clear()
-        self._shopping_sequence_active = True
-        self._mode = 'fruit_nav'
-        self._pending_patrol_advance = False
-        self.waypoints = []
-        self.current_goal = None
-        self.remaining_targets = []
-        self.remaining_labels = []
-        started = self._start_next_fruit_target()
-        if started:
-            self.notification = 'Mapping complete: visiting shopping list'
-        return started
 
     def _start_next_fruit_target(self) -> bool:
         """Begin navigation to next fruit in queue. Returns True if started."""
@@ -466,33 +437,6 @@ class AutoOperateDynamic(Operate):
         self._mode = 'fruit_nav'
         self.notification = f"Heading to fruit: {self.remaining_labels[0]}"
         return True
-
-    def _plot_truth_map(self):
-        try:
-            fruit_map = {}
-            if os.path.exists(self._fruit_loc_path):
-                with open(self._fruit_loc_path, 'r') as f:
-                    fruit_map = json.load(f)
-            if not fruit_map:
-                return
-            xs = [pose['x'] for pose in fruit_map.values()]
-            ys = [pose['y'] for pose in fruit_map.values()]
-            labels = list(fruit_map.keys())
-            plt.figure(figsize=(6, 6))
-            plt.scatter(xs, ys, c='orange', s=60, marker='o', edgecolors='k')
-            for label, x, y in zip(labels, xs, ys):
-                plt.text(x + 0.03, y + 0.03, label, fontsize=8)
-            plt.title('Discovered Fruit Map')
-            plt.xlabel('X (m)')
-            plt.ylabel('Y (m)')
-            plt.axis('equal')
-            plt.grid(True)
-            plt.tight_layout()
-            out_path = os.path.join(os.path.dirname(self._fruit_loc_path), 'truth_map_plot.png')
-            plt.savefig(out_path)
-            plt.close()
-        except Exception:
-            pass
 
     def get_fruit_locations(self) -> List[Tuple[str, float, float]]:
         """Return list of (label, x, y) for currently known fruit obstacles."""
@@ -815,46 +759,45 @@ class AutoOperateDynamic(Operate):
                 self._initial_spin_start = None
 
         # --- High covariance stabilize spin (preempts other actions) ---
-        if self._mode != 'fruit_hold':
-            try:
-                now_cov = time.time()
-                # If currently spinning due to high covariance, keep spinning until timeout
-                if self._cov_spin_until is not None and now_cov < self._cov_spin_until:
-                    # Pulsed behavior: rotate for cov_pulse_spin_time then stop for cov_pulse_stop_time
-                    if self._cov_spin_start is None:
+        try:
+            now_cov = time.time()
+            # If currently spinning due to high covariance, keep spinning until timeout
+            if self._cov_spin_until is not None and now_cov < self._cov_spin_until:
+                # Pulsed behavior: rotate for cov_pulse_spin_time then stop for cov_pulse_stop_time
+                if self._cov_spin_start is None:
+                    self._cov_spin_start = now_cov
+                period = float(self.cov_pulse_spin_time + self.cov_pulse_stop_time)
+                phase = (now_cov - self._cov_spin_start) % period
+                if phase < self.cov_pulse_spin_time:
+                    self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
+                    self.notification = 'High covariance: stabilizing spin'
+                else:
+                    self.command['motion'] = [0, 0]
+                    self.notification = 'High covariance: stabilizing spin (pulse stop)'
+                return
+            # If a spin just finished, start cooldown timer and resume
+            if self._cov_spin_until is not None and now_cov >= self._cov_spin_until:
+                self._cov_spin_until = None
+                self._cov_spin_start = None
+                self._cov_cooldown_until = now_cov + self.cov_spin_cooldown
+            # If in cooldown, skip covariance checks
+            if now_cov < self._cov_cooldown_until:
+                pass  # proceed with normal behavior
+            else:
+                # Check EKF position covariance P[0,0]
+                P = getattr(self.ekf, 'P', None)
+                if isinstance(P, np.ndarray) and P.shape[0] >= 2 and P.shape[1] >= 2:
+                    pxx = float(P[0, 0])
+                    if pxx > float(self.cov_pos_thresh):
+                        # trigger spin
+                        self._cov_spin_dir = -self._cov_spin_dir  # alternate direction
+                        self._cov_spin_until = now_cov + float(self.cov_spin_duration)
                         self._cov_spin_start = now_cov
-                    period = float(self.cov_pulse_spin_time + self.cov_pulse_stop_time)
-                    phase = (now_cov - self._cov_spin_start) % period
-                    if phase < self.cov_pulse_spin_time:
                         self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
                         self.notification = 'High covariance: stabilizing spin'
-                    else:
-                        self.command['motion'] = [0, 0]
-                        self.notification = 'High covariance: stabilizing spin (pulse stop)'
-                    return
-                # If a spin just finished, start cooldown timer and resume
-                if self._cov_spin_until is not None and now_cov >= self._cov_spin_until:
-                    self._cov_spin_until = None
-                    self._cov_spin_start = None
-                    self._cov_cooldown_until = now_cov + self.cov_spin_cooldown
-                # If in cooldown, skip covariance checks
-                if now_cov < self._cov_cooldown_until:
-                    pass  # proceed with normal behavior
-                else:
-                    # Check EKF position covariance P[0,0]
-                    P = getattr(self.ekf, 'P', None)
-                    if isinstance(P, np.ndarray) and P.shape[0] >= 2 and P.shape[1] >= 2:
-                        pxx = float(P[0, 0])
-                        if pxx > float(self.cov_pos_thresh):
-                            # trigger spin
-                            self._cov_spin_dir = -self._cov_spin_dir  # alternate direction
-                            self._cov_spin_until = now_cov + float(self.cov_spin_duration)
-                            self._cov_spin_start = now_cov
-                            self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
-                            self.notification = 'High covariance: stabilizing spin'
-                            return
-            except Exception:
-                pass
+                        return
+        except Exception:
+            pass
 
         # Periodic calibration trigger (non-blocking start)
         try:
@@ -884,7 +827,6 @@ class AutoOperateDynamic(Operate):
                     except Exception:
                         pass
                     self._emergency_replan_triggered = True
-                    self._emergency_trigger_count = max(0, self._emergency_trigger_count - 1)
             if self._emergency_mode == 'hold' and self._emergency_until <= now:
                 # Finish emergency entirely and start cooldown
                 self._emergency_mode = None
@@ -917,16 +859,7 @@ class AutoOperateDynamic(Operate):
                                 self.command['motion'] = [-self.fwd_cmd, 0]
                                 self.notification = 'Emergency: marker too close'
                                 self._emergency_replan_triggered = False
-                                self._emergency_trigger_count += 1
-                    self._last_emergency_position = (rx, ry)
-                    if self._emergency_trigger_count >= 3:
-                        self._emergency_trigger_count = 0
-                        self._cov_spin_dir = -self._cov_spin_dir or 1
-                        self._cov_spin_until = now + float(self.cov_spin_duration)
-                        self._cov_spin_start = now
-                        self.notification = 'Emergency loop detected: spinning to recover'
-                        self._plot_truth_map()
-                    return
+                                return
                 except Exception:
                     pass
 
@@ -966,16 +899,7 @@ class AutoOperateDynamic(Operate):
                                     self.command['motion'] = [-self.fwd_cmd, 0]
                                     self.notification = 'Emergency: reversing'
                                     self._emergency_replan_triggered = False
-                                    self._emergency_trigger_count += 1
-                    self._last_emergency_position = (rx, ry)
-                    if self._emergency_trigger_count >= 3:
-                        self._emergency_trigger_count = 0
-                        self._cov_spin_dir = -self._cov_spin_dir or 1
-                        self._cov_spin_until = now + float(self.cov_spin_duration)
-                        self._cov_spin_start = now
-                        self.notification = 'Emergency loop detected: spinning to recover'
-                        self._plot_truth_map()
-                    return
+                                    return
                         except Exception:
                             continue
         except Exception:
@@ -1005,10 +929,6 @@ class AutoOperateDynamic(Operate):
             # Reset scanning state when we have enough tags
             self._scan_start = None
             self._creep_until = None
-
-        if self._shopping_sequence_pending and not self._shopping_sequence_active:
-            if self._start_shopping_sequence():
-                self._shopping_sequence_pending = False
 
         # If number of EKF landmarks increased (new ArUco(s) localised), force a replan
         try:
@@ -1054,7 +974,7 @@ class AutoOperateDynamic(Operate):
                             lbl_full = self.remaining_labels[0].lower()
                             self._visited_fruits_cycle.add(lbl_full)
                             base_lbl = self._base_label(lbl_full)
-                            if self._shopping_sequence_active:
+                            if base_lbl in self.shopping_list:
                                 self._completed_shopping_labels.add(base_lbl)
                     except Exception:
                         pass
@@ -1073,30 +993,16 @@ class AutoOperateDynamic(Operate):
                         if self._start_next_fruit_target():
                             return
                     else:
-                        if self._shopping_sequence_active:
-                            self._shopping_sequence_active = False
-                            self.active = False
-                            self.command['motion'] = [0, 0]
-                            self.notification = 'Shopping list completed'
-                            return
                         # Resume patrol advancement after completing fruit visits
                         self._mode = 'patrol'
-                        # Brief reverse to clear the fruit before resuming patrol
-                        reverse_end = time.time() + 0.4
-                        while time.time() < reverse_end:
-                            self.command['motion'] = [-self.fwd_cmd, 0]
-                            try:
-                                time.sleep(0.05)
-                            except Exception:
-                                break
-                        self.command['motion'] = [0, 0]
+                        if self.shopping_list and self.shopping_list <= self._completed_shopping_labels:
+                            self.notification = 'All shopping list fruits collected'
                         # Advance patrol now if we were waiting
                         if self._pending_patrol_advance:
                             self._pending_patrol_advance = False
-                            if not (self._shopping_sequence_pending or self._shopping_sequence_active):
-                                self._advance_target()
-                                self.replan(initial=False)
-                                self.pick_next_goal()
+                            self._advance_target()
+                            self.replan(initial=False)
+                            self.pick_next_goal()
                     return
 
         # Arrival spin completion check (patrol mode only)
@@ -1130,8 +1036,6 @@ class AutoOperateDynamic(Operate):
                         return
                 # If no fruits to visit, advance patrol immediately
                 if not self._fruit_visit_queue:
-                    if self._shopping_sequence_pending or self._shopping_sequence_active:
-                        return
                     self._advance_target()
                     self.replan(initial=False)
                     self.pick_next_goal()
@@ -1264,18 +1168,7 @@ class AutoOperateDynamic(Operate):
     def _advance_target(self):
         if not hasattr(self, 'patrol_points') or len(self.patrol_points) == 0:
             return
-        next_index = (self.patrol_index + 1) % len(self.patrol_points)
-        if not self._mapping_complete and next_index == 0:
-            self._mapping_cycles_completed += 1
-            if self._mapping_cycles_completed >= 1:
-                self._mapping_complete = True
-                self._shopping_sequence_pending = True
-                self.waypoints = []
-                self.current_goal = None
-                self.remaining_targets = []
-                self.remaining_labels = []
-                return
-        self.patrol_index = next_index
+        self.patrol_index = (self.patrol_index + 1) % len(self.patrol_points)
         self.remaining_targets = [list(self.patrol_points[self.patrol_index])]
         self.remaining_labels = [self.search_list[self.patrol_index]]
         self.reached_time = None
@@ -1512,7 +1405,11 @@ class AutoOperateDynamic(Operate):
 
         if fruit_changed:
             self._save_fruit_locations()
-            self._plot_truth_map()
+            if self.enable_fruit_visits:
+                self._prepare_fruit_visit_queue(shopping_sequence=False)
+                if self._fruit_visit_queue and self._mode not in ('fruit_nav', 'fruit_hold'):
+                    self._pending_patrol_advance = True
+                    self._start_next_fruit_target()
         if new_added and self.ekf_on and self.active:
             self.replan(initial=False)
 
