@@ -81,6 +81,9 @@ class AutoOperateLevel1(AutoOperateDynamic):
         self._emergency_until = 0.0
         self._emergency_replan_triggered = False
         self._emergency_cooldown_until = 0.0
+        # Planning failure recovery timer
+        self._plan_failure_since: float | None = None
+        self.plan_failure_timeout = 8.0
 
     def periodic_perception_update(self):
         # For Level 1 the full environment is already known, so skip
@@ -108,6 +111,9 @@ class AutoOperateLevel1(AutoOperateDynamic):
             self.command['motion'] = [0, 0]
             self.notification = 'Press ENTER to start SLAM'
             return
+
+        if not self.active or not self.remaining_targets:
+            self._plan_failure_since = None
 
         # --- High covariance stabilize spin (preempts other actions) ---
         try:
@@ -278,7 +284,27 @@ class AutoOperateLevel1(AutoOperateDynamic):
 
         if self.current_goal is None and self.active:
             self.pick_next_goal()
+            if self.current_goal is not None:
+                self._plan_failure_since = None
+
         if not self.current_goal:
+            if self.active and self.remaining_targets:
+                now = time.time()
+                if self._plan_failure_since is None:
+                    self._plan_failure_since = now
+                else:
+                    if now - self._plan_failure_since >= self.plan_failure_timeout:
+                        if not self._cov_spin_until or now >= self._cov_spin_until:
+                            self._cov_spin_dir = self._cov_spin_dir if self._cov_spin_dir else 1
+                            self._cov_spin_dir = -self._cov_spin_dir
+                            self._cov_spin_until = now + float(self.cov_spin_duration)
+                            self._cov_spin_start = now
+                            self.notification = 'Planning failed: scanning for landmarks'
+                            self._plan_failure_since = None
+                            self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
+                            return
+            else:
+                self._plan_failure_since = None
             self.command['motion'] = [0, 0]
             return
 
