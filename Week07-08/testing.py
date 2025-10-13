@@ -264,7 +264,7 @@ class AutoOperateDynamic(Operate):
         self._fruit_target_last_update = 0.0
         self._fruit_target_replan_cooldown = 0.5  # seconds
         # New: face-and-confirm behavior before holding a fruit
-        self.fruit_face_timeout = 4.0  # seconds to try to see the target fruit
+        self.fruit_face_timeout = 30.0  # seconds to try to see the target fruit
         self.fruit_face_conf_min = 0.75
         self._fruit_face_start = None  # type: ignore[assignment]
         # Save patrol state when taking a detour so we can resume afterwards
@@ -276,7 +276,7 @@ class AutoOperateDynamic(Operate):
         self.emergency_bbox_width_thresh_px = 150.0  # px width indicating very close object
         self.emergency_bbox_height_thresh_px = 150.0 # px height indicating very close object
         self.emergency_center_tolerance_px = 120.0   # px from center in x to accept as frontal
-        self.emergency_dist_m = 0.20                 # estimated distance cutoff (m)
+        self.emergency_dist_m = 0.23                 # estimated distance cutoff (m)
         self.emergency_hold_time = 1.2               # seconds to stop before resuming
         self._emergency_until = 0.0
         self._emergency_replan_triggered = False
