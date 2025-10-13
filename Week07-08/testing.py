@@ -1344,8 +1344,30 @@ class AutoOperateDynamic(Operate):
         x, y, _ = self.get_pose()
         robot_xy = [x, y]
         obstacles_xy: List[List[float]] = []
-        obstacles_xy.extend([[ox, oy] for (ox, oy) in self._get_current_aruco_obstacles()])
-        obstacles_xy.extend([[float(d['x']), float(d['y'])] for d in self.discovered_obstacles])
+        # Base obstacle set: ArUcos + discovered fruits
+        aruco_obs = [[ox, oy] for (ox, oy) in self._get_current_aruco_obstacles()]
+        disc_obs = [[float(d['x']), float(d['y'])] for d in self.discovered_obstacles]
+        # If we're actively navigating to a fruit, exclude obstacles very close to the fruit target
+        # to avoid the "goal is an obstacle" deadlock that causes planning to fail.
+        target_xy = None
+        try:
+            if self._mode in ('fruit_nav', 'fruit_hold') and self._fruit_target_xy is not None:
+                target_xy = (float(self._fruit_target_xy[0]), float(self._fruit_target_xy[1]))
+        except Exception:
+            target_xy = None
+        if target_xy is not None:
+            tx, ty = target_xy
+            # Skip radius: slightly larger than inflated robot radius
+            skip_r = max(self.grid_res * 2.0, float(self.robot_radius) + float(self.safety_margin) + 0.02)
+            for ox, oy in aruco_obs:
+                obstacles_xy.append([ox, oy])
+            for ox, oy in disc_obs:
+                if math.hypot(ox - tx, oy - ty) <= skip_r:
+                    continue
+                obstacles_xy.append([ox, oy])
+        else:
+            obstacles_xy.extend(aruco_obs)
+            obstacles_xy.extend(disc_obs)
         inner = max(0.0, float(self.arena_half) - float(self.wall_clearance))
         if inner > 0.0:
             step = max(0.02, min(0.10, self.grid_res))
