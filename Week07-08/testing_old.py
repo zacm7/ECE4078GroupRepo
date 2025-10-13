@@ -52,7 +52,7 @@ class AutoOperateDynamic(Operate):
                  grid_res: float,
                  robot_radius: float,
                  safety_margin: float,
-                 merge_threshold: float = 0.30,
+                 merge_threshold: float = 0.55,
                  obs_max_range: float = 0.30,
                  patrol_points: List[Tuple[float, float]] | None = None):
         super().__init__(args)
@@ -104,6 +104,9 @@ class AutoOperateDynamic(Operate):
         self.grid_res = grid_res
         self.robot_radius = robot_radius
         self.safety_margin = safety_margin
+    # Keep a default copy of safety margin for temporary overrides during replanning
+        self._safety_margin_default = float(safety_margin)
+        self._safety_margin_saved = None  # type: ignore[assignment]
 
         # Controller params (mirror Level 2)
         self.waypoints: List[List[float]] = []
@@ -125,8 +128,10 @@ class AutoOperateDynamic(Operate):
         # Track marker count to trigger replans when new ArUcos are added
         self._last_marker_count = 0
         # Initial startup spin (environment survey) configuration
-        self._initial_spin_duration = 10.0  # seconds (user request)
-        self._initial_spin_start = time.time()
+        self._initial_spin_duration = 14.0  # seconds
+        # Start this spin when SLAM starts (ekf_on becomes True), not at program start
+        self._initial_spin_start = None
+        self._initial_spin_done = False
 
         # Arrival spin behavior (replaces previous hold+reverse): spin 8s then advance
         self.arrival_spin_duration = 20.0
@@ -140,12 +145,18 @@ class AutoOperateDynamic(Operate):
         self.last_obstacle_add_time = 0.0
         self.add_cooldown = 0.7  # seconds
         self.min_obs_separation = 0.05  # m
+    # If a different fruit label is observed within this radius of an existing fruit,
+    # treat it as the same physical object and update the existing fruit instead of
+    # creating a new one (helps collapse mislabels that are colocated).
+        self.cross_label_merge_radius = 0.05  # m (5 cm)
         # Merge detections of the same obstacle label within this radius (m)
         self.merge_threshold = float(merge_threshold)
         # Larger merge threshold for non-target fruits to cluster more aggressively
         self.merge_threshold_non_target = float(self.merge_threshold) + 0.20
         # Only consider detections as obstacles if within this distance (m) from the robot
         self.obs_max_range = float(obs_max_range)
+    # Manage temporary range override during waypoint spin
+        self._obs_range_override_active = False
         # Fruit obstacle dynamic update tuning
         self.fruit_update_alpha = 0.5          # smoothing factor for position updates
         self.fruit_replan_move_thr = 0.015     # trigger replan if cluster moved more than this (m)
@@ -239,7 +250,7 @@ class AutoOperateDynamic(Operate):
         self.shopping_list = self._load_shopping_list()
     # Feature toggle: visit fruits between patrol waypoints after arrival spin
     # Set to False to completely disable go-to-fruit-and-hold behavior
-        self.enable_fruit_visits = False
+        self.enable_fruit_visits = True
         # Opportunistic detours: while driving to a patrol point, if a shopping-list fruit is seen,
         # detour to it, hold, then resume original patrol.
         self.enable_opportunistic_detours = True
@@ -271,21 +282,26 @@ class AutoOperateDynamic(Operate):
         self.emergency_center_tolerance_px = 120.0   # px from center in x to accept as frontal
         self.emergency_dist_m = 0.20                 # estimated distance cutoff (m)
         self.emergency_hold_time = 1.2               # seconds to stop before resuming
+    # New: perform an initial stationary stop before reversing
+        self.emergency_initial_stop_time = 5.0       # seconds to stop initially before reverse
         self._emergency_until = 0.0
         self._emergency_replan_triggered = False
         # New: reverse first, then hold + replan, with a brief cooldown to avoid loops
         self.emergency_reverse_time = 0.5            # seconds to back up when triggered
         self.emergency_cooldown = 1.0                # seconds after hold to ignore retriggers
-        self._emergency_mode = None                  # None | 'reverse' | 'hold'
+        self._emergency_mode = None                  # None | 'prestop' | 'reverse' | 'hold'
         self._emergency_cooldown_until = 0.0
 
         # Periodic replan settings
         # In addition to event-driven replans, refresh the plan at a fixed cadence
-        self._periodic_replan_interval = 18  # seconds
+        self._periodic_replan_interval = 30  # seconds
         self._last_periodic_replan = time.time()
     # Plan-failure watchdog: if planning fails continuously for this long, trigger a cov spin
         self._plan_fail_start = None  # type: ignore[assignment]
         self._plan_fail_threshold = 10.0  # seconds
+        # Safety margin probe when planning is stuck: temporarily reduce margin and try
+        self._safety_probe_active = False
+        self._safety_probe_until = 0.0
 
     def _save_fruit_locations(self):
         """Persist fruit obstacle locations as enumerated JSON mapping.
@@ -462,7 +478,7 @@ class AutoOperateDynamic(Operate):
         # Cancel any pending arrival spin from patrol so detour doesn't spin at fruit
         self._arrival_spin_start = None
         self._arrival_spin_pulse_start = None
-        self.notification = f"Detour to fruit: {flabel}"
+        self.notification = f"Heading to {flabel} (detour)"
         return True
 
     def get_fruit_locations(self) -> List[Tuple[str, float, float]]:
@@ -674,7 +690,7 @@ class AutoOperateDynamic(Operate):
                 P = getattr(self.ekf, 'P', None)
                 if isinstance(P, np.ndarray) and P.shape[0] >= 2 and P.shape[1] >= 2:
                     Pxy = P[0:2, 0:2]
-                    print("Robot position covariance (P[0:2,0:2]):\n", Pxy)
+                    #print("Robot position covariance (P[0:2,0:2]):\n", Pxy)
             except Exception:
                 pass
         except Exception:
@@ -802,6 +818,10 @@ class AutoOperateDynamic(Operate):
             self.notification = 'Press ENTER to start SLAM'
             return
 
+        # If SLAM just started, kick off the initial spin once
+        if getattr(self, '_initial_spin_start', None) is None and not getattr(self, '_initial_spin_done', False):
+            self._initial_spin_start = time.time()
+
         # Immediate SLAM map save handling (mirror operate.py 's' key behavior)
         # We do this here so the user gets instant feedback in autonomous mode
         try:
@@ -831,6 +851,7 @@ class AutoOperateDynamic(Operate):
             else:
                 # Finish initial spin
                 self._initial_spin_start = None
+                self._initial_spin_done = True
 
         # --- High covariance stabilize spin (preempts other actions) ---
         try:
@@ -888,10 +909,31 @@ class AutoOperateDynamic(Operate):
             self._perform_calib_scan_step()
             return
 
+        # If we had temporarily reduced the safety margin to probe a path, restore after window
+        try:
+            if self._safety_probe_active and time.time() >= float(self._safety_probe_until):
+                # Restore safety margin and replan once
+                restore_to = float(self._safety_margin_default)
+                self.safety_margin = restore_to
+                self._safety_probe_active = False
+                self.notification = 'Restored safety margin; replanning'
+                try:
+                    if self.active:
+                        self.replan(initial=False)
+                        self.pick_next_goal()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # --- Emergency stop check (overrides scanning and regular motion) ---
         try:
             now = time.time()
             # Emergency state transitions
+            if self._emergency_mode == 'prestop' and self._emergency_until <= now:
+                # After initial stop, begin reverse phase
+                self._emergency_mode = 'reverse'
+                self._emergency_until = now + float(self.emergency_reverse_time)
             if self._emergency_mode == 'reverse' and self._emergency_until <= now:
                 # Switch to hold phase
                 self._emergency_mode = 'hold'
@@ -911,9 +953,13 @@ class AutoOperateDynamic(Operate):
                 self._emergency_replan_triggered = False
 
             # Active emergency phase handling
-            if self._emergency_mode in ('reverse', 'hold') and self._emergency_until > now:
+            if self._emergency_mode in ('prestop', 'reverse', 'hold') and self._emergency_until > now:
                 remaining = self._emergency_until - now
-                if self._emergency_mode == 'reverse':
+                if self._emergency_mode == 'prestop':
+                    # Stop all motion during initial stop window
+                    self.command['motion'] = [0, 0]
+                    self.notification = f'Emergency: stopping ({remaining:.1f}s)'
+                elif self._emergency_mode == 'reverse':
                     # Back up during reverse window
                     self.command['motion'] = [-self.fwd_cmd, 0]
                     self.notification = f'Emergency: reversing ({remaining:.1f}s)'
@@ -964,13 +1010,13 @@ class AutoOperateDynamic(Operate):
                                 d_h = (fx * W_assumed) / max(1.0, h_px)
                                 d_est = min(d_w, d_h)
                                 if d_est <= self.emergency_dist_m:
-                                    # Start reverse phase then hold phase
-                                    rev = float(self.emergency_reverse_time)
-                                    self._emergency_mode = 'reverse'
-                                    self._emergency_until = now + rev
-                                    # Immediately set motion to reverse
-                                    self.command['motion'] = [-self.fwd_cmd, 0]
-                                    self.notification = 'Emergency: reversing'
+                                    # Start with an initial stop, then reverse, then hold
+                                    stop_t = float(self.emergency_initial_stop_time)
+                                    self._emergency_mode = 'prestop'
+                                    self._emergency_until = now + stop_t
+                                    # Immediately stop motion
+                                    self.command['motion'] = [0, 0]
+                                    self.notification = 'Emergency: stopping'
                                     self._emergency_replan_triggered = False
                                     return
                         except Exception:
@@ -1190,6 +1236,10 @@ class AutoOperateDynamic(Operate):
         if self._mode == 'patrol' and self._arrival_spin_start is not None:
             elapsed_arrival = now - self._arrival_spin_start
             if elapsed_arrival < self.arrival_spin_duration:
+                # Increase detection range while spinning at waypoint
+                if not self._obs_range_override_active:
+                    self.obs_max_range = 0.65
+                    self._obs_range_override_active = True
                 # Initialize pulse timer
                 if self._arrival_spin_pulse_start is None:
                     self._arrival_spin_pulse_start = self._arrival_spin_start
@@ -1204,6 +1254,10 @@ class AutoOperateDynamic(Operate):
                 self.notification = f'Spinning at waypoint (pulsed) ({remaining:.1f}s left)'
                 return
             else:
+                # Spin finished — revert detection range
+                if self._obs_range_override_active:
+                    self.obs_max_range = 0.45
+                    self._obs_range_override_active = False
                 # Spin finished -> attempt fruit visits before advancing (if enabled)
                 self._arrival_spin_start = None
                 self._arrival_spin_pulse_start = None
@@ -1363,16 +1417,38 @@ class AutoOperateDynamic(Operate):
             now_fail = time.time()
             if self._plan_fail_start is None:
                 self._plan_fail_start = now_fail
-            # If we've been failing to plan for long enough, trigger a covariance spin once
-            elif (now_fail - self._plan_fail_start) >= float(self._plan_fail_threshold):
-                # Only if not already spinning/calibrating/holding/emergency
+                self._plan_fail_target_snapshot = (list(self.remaining_targets[0]) if self.remaining_targets else None)
+            else:
+                # If target changed since we started failing, reset the timer
+                current_target_snapshot = (list(self.remaining_targets[0]) if self.remaining_targets else None)
+                if current_target_snapshot != getattr(self, '_plan_fail_target_snapshot', None):
+                    self._plan_fail_start = now_fail
+                    self._plan_fail_target_snapshot = current_target_snapshot
+
+            # If we've been failing to plan for long enough, either stabilize or skip to next target
+            fail_elapsed = now_fail - float(self._plan_fail_start or now_fail)
+            # First threshold: covariance spin assist (kept at existing threshold)
+            if fail_elapsed >= float(self._plan_fail_threshold):
                 if (self._cov_spin_until is None) and (not self._calib_mode) and (self._emergency_mode is None) and (self._mode != 'fruit_hold'):
                     self._cov_spin_dir = -self._cov_spin_dir  # alternate direction
                     self._cov_spin_until = now_fail + float(self.cov_spin_duration)
                     self._cov_spin_start = now_fail
                     self.notification = 'Planning failed for 10s: starting stabilizing spin'
-                # Reset timer so we don't retrigger continuously
-                self._plan_fail_start = None
+                    # Do not reset plan fail timer yet; allow it to continue accruing toward skip
+            # Second threshold: for a brief window, reduce safety margin to try finding a path
+            if fail_elapsed >= 20.0 and not self._safety_probe_active:
+                try:
+                    self._safety_margin_saved = self.safety_margin
+                    self.safety_margin = 0.0
+                    self._safety_probe_active = True
+                    self._safety_probe_until = now_fail + 3.0
+                    self.notification = 'Planning failed >20s: trying with reduced safety margin'
+                    # Attempt an immediate replan with reduced margin
+                    if self.active:
+                        self.replan(initial=False)
+                        self.pick_next_goal()
+                except Exception:
+                    pass
 
     def _advance_target(self):
         if not hasattr(self, 'patrol_points') or len(self.patrol_points) == 0:
@@ -1419,12 +1495,16 @@ class AutoOperateDynamic(Operate):
     # ============= Perception integration =============
     def periodic_perception_update(self):
         """Process detector outputs to add unknown obstacles, and replan if new obstacles observed."""
+        # Do not update fruit locations during the initial spin window
+        if getattr(self, '_initial_spin_start', None) is not None and not getattr(self, '_initial_spin_done', False):
+            return
         bboxes = getattr(self, 'detector_output', None)
         if not isinstance(bboxes, (list, tuple)) or len(bboxes) == 0:
             return
         now = time.time()
         new_added = False
         fruit_changed = False
+        center_found = False  # Track if any detection is in the center third this iteration
 
         # Prune stale fruit obstacles (not updated recently)
         # if self.discovered_obstacles:
@@ -1460,6 +1540,24 @@ class AutoOperateDynamic(Operate):
                 continue
             if conf < 0.8:
                 continue
+
+            # Only update fruit locations for detections in the center third of the image
+            try:
+                u = float(xywh[0])
+                # Estimate image width: prefer 2*cx when intrinsics available, else assume 320px
+                img_w = float(self.cx) * 2.0 if getattr(self, 'cx', None) is not None else 320.0
+                center_tol = img_w / 6.0  # half-width of the center third
+                if abs(u - float(self.cx)) > center_tol:
+                    # Skip updates for off-center detections to reduce jittery position changes
+                    continue
+                else:
+                    # Mark that a centered fruit is present this loop and set a transient message
+                    if not label.startswith('aruco'):
+                        center_found = True
+                        self.notification = "Fruit is in center"
+            except Exception:
+                # If anything goes wrong computing the check, fall back to allowing the update
+                pass
 
             # Project detection to a world point using TargetPoseEst if available; otherwise fallback to heuristic
             ox, oy = None, None
@@ -1588,6 +1686,73 @@ class AutoOperateDynamic(Operate):
                 # merged into an existing cluster; skip the rest of add process
                 continue
 
+            # --- Cross-label merge: if a different fruit is within a small radius, update the first one ---
+            # Prevents duplicate obstacles when two different labels are reported for the same physical fruit.
+            try:
+                nearest_idx = -1
+                nearest_dist = 1e9
+                for idx, d in enumerate(self.discovered_obstacles):
+                    existing_label = str(d.get('label', ''))
+                    base_existing = existing_label.rsplit('_', 1)[0] if ('_' in existing_label and existing_label.rsplit('_',1)[1].isdigit()) else existing_label
+                    base_new = label.rsplit('_', 1)[0] if ('_' in label and label.rsplit('_',1)[1].isdigit()) else label
+                    if base_existing == base_new:
+                        # Skip same-label here; handled above
+                        continue
+                    px, py = float(d.get('x', 0.0)), float(d.get('y', 0.0))
+                    dist_xy = math.hypot(ox - px, oy - py)
+                    if dist_xy <= float(self.cross_label_merge_radius) and dist_xy < nearest_dist:
+                        nearest_dist = dist_xy
+                        nearest_idx = idx
+                if nearest_idx >= 0:
+                    d = self.discovered_obstacles[nearest_idx]
+                    px, py = float(d.get('x', 0.0)), float(d.get('y', 0.0))
+                    moved = 0.0
+                    try:
+                        # Use Kalman-style update if covariance present (initialize if missing)
+                        if 'P' not in d or not isinstance(d['P'], np.ndarray) or d['P'].shape != (2, 2):
+                            d['P'] = np.diag([0.04, 0.04])
+                        P_prev = d['P']
+                        Q = self.fruit_Q
+                        R = self.fruit_R
+                        P_pred = P_prev + Q
+                        z = np.array([ox, oy])
+                        x_prev_vec = np.array([px, py])
+                        S = P_pred + R
+                        K = P_pred @ np.linalg.inv(S)
+                        innovation = z - x_prev_vec
+                        x_new_vec = x_prev_vec + K @ innovation
+                        P_new = (np.eye(2) - K) @ P_pred
+                        new_x = float(x_new_vec[0])
+                        new_y = float(x_new_vec[1])
+                        moved = math.hypot(new_x - px, new_y - py)
+                        d['x'] = new_x
+                        d['y'] = new_y
+                        d['P'] = P_new
+                        d['count'] = int(d.get('count', 1)) + 1
+                        d['last_seen'] = now
+                        self._log_obstacle(new_x, new_y, label=str(d.get('label','')), method='cross-merge-kf')
+                        self._flush_log(force=False)
+                    except Exception:
+                        # Fallback smoothing update
+                        alpha = float(self.fruit_update_alpha)
+                        new_x = (1 - alpha) * px + alpha * ox
+                        new_y = (1 - alpha) * py + alpha * oy
+                        moved = math.hypot(new_x - px, new_y - py)
+                        d['x'] = new_x
+                        d['y'] = new_y
+                        d['count'] = int(d.get('count', 1)) + 1
+                        d['last_seen'] = now
+                        self._log_obstacle(new_x, new_y, label=str(d.get('label','')), method='cross-merge')
+                        self._flush_log(force=False)
+                    if moved > self.fruit_replan_move_thr:
+                        new_added = True
+                    fruit_changed = True
+                    # Do not create a new obstacle for this detection
+                    continue
+            except Exception:
+                # If anything goes wrong, fall back to normal flow
+                pass
+
             # Ignore duplicates amongst known and discovered obstacles (any label) using a wider gate
             all_obs = []
             # known_obstacles unused; dynamic markers handled separately
@@ -1616,6 +1781,8 @@ class AutoOperateDynamic(Operate):
             self._save_fruit_locations()
         if new_added and self.ekf_on and self.active:
             self.replan(initial=False)
+        # If no centered detection this iteration, do not overwrite notification; it will revert
+        # naturally to whatever auto_nav_step set earlier in the loop.
 
 
 if __name__ == "__main__":
@@ -1632,10 +1799,10 @@ if __name__ == "__main__":
     parser.add_argument("--robot_radius", type=float, default=0.11)
     parser.add_argument("--safety_margin", type=float, default=0.095)
     # Merge threshold (main option). You can also use --merge_thresh alias below
-    parser.add_argument("--merge_threshold", type=float, default=0.55,
+    parser.add_argument("--merge_threshold", type=float, default=0.35,
                         help="Merge radius (meters) for clustering detections of the same fruit label")
     # only count/add obstacles when seen within this distance (meters)
-    parser.add_argument("--obs_max_range", type=float, default=0.55)
+    parser.add_argument("--obs_max_range", type=float, default=0.45)
     parser.add_argument("--play_data", action='store_true')
     parser.add_argument("--save_data", action='store_true')
     args, _ = parser.parse_known_args()
