@@ -1,1 +1,0 @@
-{"pose": [[0.19440222151294864], [-0.586557149570105], [-0.4914139851770827]], "imgfname": "C:\\Users\\zacmc\\Documents\\Uni\\Engineering\\2025\\ECE4078\\ECE4078GroupRepo\\Week07-08\\lab_output/pred_0.png"}

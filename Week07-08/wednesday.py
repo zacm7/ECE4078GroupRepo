@@ -146,7 +146,7 @@ class AutoOperateDynamic(Operate):
 
         # Covariance-based stabilize spin parameters
         self.cov_pos_thresh = 0.09        # trigger threshold on P[0,0]
-        self.cov_spin_duration = 9.0      # seconds to spin when triggered (increased from 6s)
+        self.cov_spin_duration = 13.0     # seconds to spin when triggered (slightly increased)
         self.cov_spin_cooldown = 4.0      # seconds to wait before checking again
         self._cov_spin_until = None       # type: ignore[assignment]
         self._cov_cooldown_until = 0.0
@@ -517,18 +517,30 @@ class AutoOperateDynamic(Operate):
             if now_cov < self._cov_cooldown_until:
                 pass  # proceed with normal behavior
             else:
-                # Check EKF position covariance P[0,0]
-                P = getattr(self.ekf, 'P', None)
-                if isinstance(P, np.ndarray) and P.shape[0] >= 2 and P.shape[1] >= 2:
-                    pxx = float(P[0, 0])
-                    if pxx > float(self.cov_pos_thresh):
-                        # trigger spin
-                        self._cov_spin_dir = -self._cov_spin_dir  # alternate direction
-                        self._cov_spin_until = now_cov + float(self.cov_spin_duration)
-                        self._cov_spin_start = now_cov
-                        self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
-                        self.notification = 'High covariance: stabilizing spin'
-                        return
+                # Defer covariance spin while holding at a target; finish the hold first
+                in_hold_window = False
+                try:
+                    # We consider ourselves in the hold window if we've started holding
+                    # (reached_time set), not yet started the post-hold reverse, and the
+                    # hold timer hasn't elapsed.
+                    if (self.reached_time is not None) and (self._reverse_until is None):
+                        if (now_cov - float(self.reached_time)) < float(self.hold_duration):
+                            in_hold_window = True
+                except Exception:
+                    in_hold_window = False
+                if not in_hold_window:
+                    # Check EKF position covariance P[0,0]
+                    P = getattr(self.ekf, 'P', None)
+                    if isinstance(P, np.ndarray) and P.shape[0] >= 2 and P.shape[1] >= 2:
+                        pxx = float(P[0, 0])
+                        if pxx > float(self.cov_pos_thresh):
+                            # trigger spin
+                            self._cov_spin_dir = -self._cov_spin_dir  # alternate direction
+                            self._cov_spin_until = now_cov + float(self.cov_spin_duration)
+                            self._cov_spin_start = now_cov
+                            self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
+                            self.notification = 'High covariance: stabilizing spin'
+                            return
         except Exception:
             pass
 
@@ -901,7 +913,7 @@ if __name__ == "__main__":
     parser.add_argument("--robot_radius", type=float, default=0.16)
     parser.add_argument("--safety_margin", type=float, default=0.3)
     # default merge threshold increased to 0.50 (50 cm)
-    parser.add_argument("--merge_threshold", type=float, default=0.80)
+    parser.add_argument("--merge_threshold", type=float, default=0.60)
     # only count/add obstacles when seen within this distance (meters)
     parser.add_argument("--obs_max_range", type=float, default=0.48)
     parser.add_argument("--play_data", action='store_true')
