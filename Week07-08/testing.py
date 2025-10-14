@@ -286,6 +286,11 @@ class AutoOperateDynamic(Operate):
         self._emergency_cooldown_until = 0.0
         self._emergency_trigger_count = 0
         self._last_emergency_position = None
+        self._emergency_spin_pending = False
+        self._emergency_spin_start = None
+        self._emergency_spin_plot_done = False
+        # Detection gating
+        self.center_detect_tolerance_px = 60.0
 
     def _save_fruit_locations(self):
         """Persist fruit obstacle locations as enumerated JSON mapping.
@@ -815,7 +820,7 @@ class AutoOperateDynamic(Operate):
                 self._initial_spin_start = None
 
         # --- High covariance stabilize spin (preempts other actions) ---
-        if self._mode != 'fruit_hold':
+        if self._mode != 'fruit_hold' and self._emergency_mode is None:
             try:
                 now_cov = time.time()
                 # If currently spinning due to high covariance, keep spinning until timeout
@@ -885,25 +890,55 @@ class AutoOperateDynamic(Operate):
                         pass
                     self._emergency_replan_triggered = True
                     self._emergency_trigger_count = max(0, self._emergency_trigger_count - 1)
+                self._emergency_spin_pending = False
+                self._emergency_spin_start = None
+                self._emergency_spin_plot_done = False
             if self._emergency_mode == 'hold' and self._emergency_until <= now:
                 # Finish emergency entirely and start cooldown
                 self._emergency_mode = None
                 self._emergency_cooldown_until = now + float(self.emergency_cooldown)
                 self._emergency_until = 0.0
                 self._emergency_replan_triggered = False
+                self._emergency_spin_pending = False
+                self._emergency_spin_start = None
+                self._emergency_spin_plot_done = False
 
             # Active emergency phase handling
             if self._emergency_mode in ('reverse', 'hold') and self._emergency_until > now:
                 remaining = self._emergency_until - now
                 if self._emergency_mode == 'reverse':
+                    if self._emergency_spin_pending:
+                        if self._emergency_spin_start is None:
+                            self._emergency_spin_start = now
+                            if not self._emergency_spin_plot_done:
+                                self._plot_truth_map()
+                                self._emergency_spin_plot_done = True
+                        elapsed_spin = now - float(self._emergency_spin_start)
+                        period = float(self.cov_pulse_spin_time + self.cov_pulse_stop_time)
+                        phase = elapsed_spin % period
+                        if phase < self.cov_pulse_spin_time:
+                            self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
+                        else:
+                            self.command['motion'] = [0, 0]
+                        remaining_spin = max(0.0, float(self.cov_spin_duration) - elapsed_spin)
+                        self.notification = f'Emergency: spin recovery ({remaining_spin:.1f}s)'
+                        self._emergency_until = float(self._emergency_spin_start) + float(self.cov_spin_duration)
+                        if elapsed_spin >= float(self.cov_spin_duration):
+                            self._emergency_spin_pending = False
+                            self._emergency_spin_start = None
+                            self._emergency_mode = None
+                            self._emergency_until = 0.0
+                            self._emergency_cooldown_until = now + float(self.emergency_cooldown)
+                        return
                     # Back up during reverse window
                     self.command['motion'] = [-self.fwd_cmd, 0]
                     self.notification = f'Emergency: reversing ({remaining:.1f}s)'
+                    return
                 else:
                     # Hold still during hold window
                     self.command['motion'] = [0, 0]
                     self.notification = f'Emergency: holding ({remaining:.1f}s)'
-                return
+                    return
             if self.emergency_enabled:
                 # First, use EKF-estimated ArUco poses to detect proximity
                 try:
@@ -918,15 +953,14 @@ class AutoOperateDynamic(Operate):
                                 self.notification = 'Emergency: marker too close'
                                 self._emergency_replan_triggered = False
                                 self._emergency_trigger_count += 1
-                    self._last_emergency_position = (rx, ry)
-                    if self._emergency_trigger_count >= 3:
-                        self._emergency_trigger_count = 0
-                        self._cov_spin_dir = -self._cov_spin_dir or 1
-                        self._cov_spin_until = now + float(self.cov_spin_duration)
-                        self._cov_spin_start = now
-                        self.notification = 'Emergency loop detected: spinning to recover'
-                        self._plot_truth_map()
-                    return
+                                self._last_emergency_position = (rx, ry)
+                                if self._emergency_trigger_count >= 3:
+                                    self._emergency_trigger_count = 0
+                                    self._cov_spin_dir = -self._cov_spin_dir or 1
+                                    self._emergency_spin_pending = True
+                                    self._emergency_spin_start = None
+                                    self._emergency_spin_plot_done = False
+                                return
                 except Exception:
                     pass
 
@@ -967,15 +1001,14 @@ class AutoOperateDynamic(Operate):
                                     self.notification = 'Emergency: reversing'
                                     self._emergency_replan_triggered = False
                                     self._emergency_trigger_count += 1
-                    self._last_emergency_position = (rx, ry)
-                    if self._emergency_trigger_count >= 3:
-                        self._emergency_trigger_count = 0
-                        self._cov_spin_dir = -self._cov_spin_dir or 1
-                        self._cov_spin_until = now + float(self.cov_spin_duration)
-                        self._cov_spin_start = now
-                        self.notification = 'Emergency loop detected: spinning to recover'
-                        self._plot_truth_map()
-                    return
+                                    self._last_emergency_position = (rx, ry)
+                                    if self._emergency_trigger_count >= 3:
+                                        self._emergency_trigger_count = 0
+                                        self._cov_spin_dir = -self._cov_spin_dir or 1
+                                        self._emergency_spin_pending = True
+                                        self._emergency_spin_start = None
+                                        self._emergency_spin_plot_done = False
+                                    return
                         except Exception:
                             continue
         except Exception:
@@ -1391,6 +1424,13 @@ class AutoOperateDynamic(Operate):
 
             # Range gate: only accept detections within obs_max_range from the robot
             if math.hypot(float(ox) - x, float(oy) - y) > self.obs_max_range:
+                continue
+
+            try:
+                u_center = float(xywh[0])
+                if abs(u_center - cx) > float(self.center_detect_tolerance_px):
+                    continue
+            except Exception:
                 continue
 
             # Ignore detections that correspond to the CURRENT target only
