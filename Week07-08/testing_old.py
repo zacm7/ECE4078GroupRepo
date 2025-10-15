@@ -359,6 +359,11 @@ class AutoOperateDynamic(Operate):
         # Waypoint-based probe control (new)
         self._safety_probe_waypoints_left = 0
         self._wp_counted = False
+    # Timed multi-stage probe control
+    # stage: 0=inactive, 1=0.045, 2=0.020, 3=0.000
+        self._safety_probe_stage = 0
+        self._safety_probe_stage_start = 0.0
+        self._safety_probe_stage_timeout = 10.0
         # Stepwise safety probe candidates and index (filled on demand after 20s of failures)
         self._safety_probe_candidates = []
         self._safety_probe_index = -1
@@ -678,14 +683,17 @@ class AutoOperateDynamic(Operate):
                 self._wp_counted = True
                 self._safety_probe_waypoints_left = max(0, int(self._safety_probe_waypoints_left) - 1)
                 if self._safety_probe_waypoints_left <= 0:
-                    # Restore margin and replan
-                    restore_to = float(self._safety_margin_default)
+                    # Restore margin and replan (end of current probe stage)
+                    restore_to = float(self._safety_margin_default if getattr(self, '_safety_margin_default', None) is not None else self.safety_margin)
                     self.safety_margin = restore_to
                     try:
                         print(f"SAfety Margin this: {float(self.safety_margin):.3f}", flush=True)
                     except Exception:
                         pass
+                    # Clear probe state so future failures can start over
                     self._safety_probe_active = False
+                    self._safety_probe_stage = 0
+                    self._safety_probe_stage_start = 0.0
                     self.notification = 'Probe complete (5 waypoints) — restoring safety margin'
                     try:
                         if self.active:
@@ -1994,23 +2002,22 @@ class AutoOperateDynamic(Operate):
                     self._cov_spin_start = now_fail
                     self.notification = 'Planning failed for 10s: starting stabilizing spin'
                     # Do not reset plan fail timer yet; allow it to continue accruing toward skip
-            # Second threshold: after 20s, use a fixed reduced safety margin for 5 waypoints, then restore
+            # Second threshold: after 20s, begin timed multi-stage safety probe
             if fail_elapsed >= 20.0:
                 try:
-                    # Initialize fixed probe if not already active
+                    now_ts = now_fail
                     if not self._safety_probe_active:
-                        # Save original margin for restoration later and apply fixed margin
-                        self._safety_margin_saved = self.safety_margin
+                        # Stage 1: 0.045
+                        self._safety_margin_saved = getattr(self, '_safety_margin_saved', None) or self.safety_margin
                         self.safety_margin = 0.045
                         try:
                             print(f"SAfety Margin this: {float(self.safety_margin):.3f}", flush=True)
                         except Exception:
                             pass
                         self._safety_probe_active = True
-                        # Keep reduced margin for 5 waypoint arrivals
+                        self._safety_probe_stage = 1
+                        self._safety_probe_stage_start = now_ts
                         self._safety_probe_waypoints_left = 5
-                        # Record start time (not used for stepping anymore but kept for diagnostics)
-                        self._safety_probe_candidate_start = now_fail
                         # Cancel any ongoing covariance spin and suppress while probing
                         if self._cov_spin_until is not None:
                             self._cov_spin_until = None
@@ -2019,13 +2026,62 @@ class AutoOperateDynamic(Operate):
                             self._cov_cooldown_until = time.time() + max(2.0, self.cov_spin_cooldown)
                         except Exception:
                             pass
-                        self.notification = f"Planning failed >20s: using safety margin {self.safety_margin:.3f} for 5 waypoints"
-                        # Immediate replan with fixed reduced margin
+                        self.notification = f"Planning failed >20s: using safety margin {self.safety_margin:.3f} (stage 1)"
                         if self.active:
                             self.replan(initial=False)
                             self.pick_next_goal()
                             return
-                    # If already probing, do nothing here; restoration handled on waypoint arrivals
+                    else:
+                        # Already probing — check stage timeouts and escalate if still failing
+                        stage = int(getattr(self, '_safety_probe_stage', 0))
+                        started = float(getattr(self, '_safety_probe_stage_start', now_ts))
+                        timeout = float(getattr(self, '_safety_probe_stage_timeout', 10.0))
+                        if stage == 1 and (now_ts - started) >= timeout:
+                            # Escalate to Stage 2: 0.020
+                            self.safety_margin = 0.020
+                            try:
+                                print(f"SAfety Margin this: {float(self.safety_margin):.3f}", flush=True)
+                            except Exception:
+                                pass
+                            self._safety_probe_stage = 2
+                            self._safety_probe_stage_start = now_ts
+                            self._safety_probe_waypoints_left = 5
+                            # Cancel any ongoing covariance spin
+                            if self._cov_spin_until is not None:
+                                self._cov_spin_until = None
+                                self._cov_spin_start = None
+                            try:
+                                self._cov_cooldown_until = time.time() + max(2.0, self.cov_spin_cooldown)
+                            except Exception:
+                                pass
+                            self.notification = f"Escalating safety probe: margin {self.safety_margin:.3f} (stage 2)"
+                            if self.active:
+                                self.replan(initial=False)
+                                self.pick_next_goal()
+                                return
+                        elif stage == 2 and (now_ts - started) >= timeout:
+                            # Escalate to Stage 3: 0.000
+                            self.safety_margin = 0.000
+                            try:
+                                print(f"SAfety Margin this: {float(self.safety_margin):.3f}", flush=True)
+                            except Exception:
+                                pass
+                            self._safety_probe_stage = 3
+                            self._safety_probe_stage_start = now_ts
+                            self._safety_probe_waypoints_left = 5
+                            if self._cov_spin_until is not None:
+                                self._cov_spin_until = None
+                                self._cov_spin_start = None
+                            try:
+                                self._cov_cooldown_until = time.time() + max(2.0, self.cov_spin_cooldown)
+                            except Exception:
+                                pass
+                            self.notification = f"Escalating safety probe: margin {self.safety_margin:.3f} (stage 3)"
+                            if self.active:
+                                self.replan(initial=False)
+                                self.pick_next_goal()
+                                return
+                        # Stage 3 has no further escalation; restoration occurs on waypoint arrivals
                 except Exception:
                     pass
 
