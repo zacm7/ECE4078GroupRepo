@@ -1,5 +1,5 @@
-potato
 garlic
+lemon
+potato
+pear
 tomato
-lemon 
-orange 
