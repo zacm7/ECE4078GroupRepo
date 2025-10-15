@@ -71,7 +71,7 @@ class AutoOperateDynamic(Operate):
 
         # --- Patrol model (replaces partial map targets) ---
         # Default sequence; robot assumed to start near (0,0).
-        default_patrol = [(-0.65, 0.65), (-0.70, -0.70), (0.75, -0.75), (0.80, 0.80)]
+        default_patrol = [(-0.67, 0.67), (-0.67, -0.67), (0.67, -0.67), (0.67, 0.67)]
         pts: List[Tuple[float, float]] = []
         if patrol_points:
             pts = [(float(a), float(b)) for (a, b) in patrol_points]
@@ -82,6 +82,44 @@ class AutoOperateDynamic(Operate):
             pts.append(default_patrol[len(pts) % len(default_patrol)])
         if len(pts) > 4:
             pts = pts[:4]
+        # Optional: interactive reorder via terminal (digits 1-4 like 2341)
+        try:
+            import sys
+            # Only prompt when running in an interactive terminal
+            if getattr(sys, 'stdin', None) is not None and sys.stdin.isatty():
+                try:
+                    print("Patrol waypoints (1-4):", flush=True)
+                    for i, (px, py) in enumerate(pts, start=1):
+                        try:
+                            print(f" {i}: ({float(px):.2f}, {float(py):.2f})", flush=True)
+                        except Exception:
+                            print(f" {i}: ({px}, {py})", flush=True)
+                    user_in = input("Enter patrol order (e.g., 2341) or press ENTER for default: ").strip()
+                except Exception:
+                    user_in = ""
+                # Normalize to just the digits 1-4
+                digits = [ch for ch in user_in if ch in '1234']
+                if len(digits) == 4 and len(set(digits)) == 4:
+                    order = [int(d) - 1 for d in digits]
+                    if all(0 <= idx < 4 for idx in order):
+                        try:
+                            pts = [pts[idx] for idx in order]
+                            print(f"Using patrol order {''.join(digits)}: "
+                                  f"[{', '.join([f'({float(x):.2f}, {float(y):.2f})' for x, y in pts])}]",
+                                  flush=True)
+                        except Exception:
+                            # Fallback print without formatting
+                            print(f"Using patrol order {''.join(digits)}: {pts}", flush=True)
+                else:
+                    # Keep default order; optionally echo current order for clarity
+                    try:
+                        curr = ''.join(str(i) for i in range(1, 5))
+                        print(f"Keeping default patrol order {curr}", flush=True)
+                    except Exception:
+                        pass
+        except Exception:
+            # Never let input issues break initialization
+            pass
         self.patrol_points: List[Tuple[float, float]] = pts
         self.patrol_index: int = 0
 
@@ -165,7 +203,7 @@ class AutoOperateDynamic(Operate):
         self.fruit_Q = np.diag([1e-5, 1e-5])   # process noise (very small, assume static fruit)
         self.fruit_R = np.diag([0.01, 0.01])   # measurement noise (tunable)
         # Arena virtual walls (2.4x2.4m centered at origin) with 10cm keep-out
-        self.arena_half = 1.30
+        self.arena_half = 1.267
         self.wall_clearance = 0.10
 
         # Cache intrinsics (for projection of bbox -> world)
@@ -330,6 +368,8 @@ class AutoOperateDynamic(Operate):
         self.emergency_cooldown = 1.0                # seconds after hold to ignore retriggers
         self._emergency_mode = None                  # None | 'prestop' | 'reverse' | 'hold'
         self._emergency_cooldown_until = 0.0
+    # Track which detection triggered the emergency so we can announce it on hold
+        self._emergency_trigger_label = None  # type: ignore[assignment]
 
         # Periodic replan settings
         # In addition to event-driven replans, refresh the plan at a fixed cadence
@@ -668,6 +708,10 @@ class AutoOperateDynamic(Operate):
                     # Restore margin and replan
                     restore_to = float(self._safety_margin_default)
                     self.safety_margin = restore_to
+                    try:
+                        print(f"SAfety Margin this: {float(self.safety_margin):.3f}", flush=True)
+                    except Exception:
+                        pass
                     self._safety_probe_active = False
                     self.notification = 'Probe complete (5 waypoints) — restoring safety margin'
                     try:
@@ -1188,6 +1232,15 @@ class AutoOperateDynamic(Operate):
                 # Switch to hold phase
                 self._emergency_mode = 'hold'
                 self._emergency_until = now + float(self.emergency_hold_time)
+                # Announce a collection for the object that triggered the emergency
+                try:
+                    lbl = self._emergency_trigger_label
+                    if isinstance(lbl, str) and lbl:
+                        self._announce(f"{lbl} collected")
+                    # Clear after announcing to avoid repeats on subsequent emergencies
+                    self._emergency_trigger_label = None
+                except Exception:
+                    pass
                 # Trigger a replan once when we start holding
                 if not self._emergency_replan_triggered and self.active:
                     try:
@@ -1277,6 +1330,15 @@ class AutoOperateDynamic(Operate):
                                     stop_t = float(self.emergency_initial_stop_time)
                                     self._emergency_mode = 'prestop'
                                     self._emergency_until = now + stop_t
+                                    # Record the base label (preserve original casing) to announce on hold
+                                    try:
+                                        raw_lbl = str(det[0])
+                                        self._emergency_trigger_label = self._base_label(raw_lbl)
+                                    except Exception:
+                                        try:
+                                            self._emergency_trigger_label = str(det[0])
+                                        except Exception:
+                                            self._emergency_trigger_label = None
                                     # Immediately stop motion
                                     self.command['motion'] = [0, 0]
                                     self.notification = 'Emergency: stopping'
@@ -1896,68 +1958,38 @@ class AutoOperateDynamic(Operate):
                     self._cov_spin_start = now_fail
                     self.notification = 'Planning failed for 10s: starting stabilizing spin'
                     # Do not reset plan fail timer yet; allow it to continue accruing toward skip
-            # Second threshold: after 20s, try a stepwise safety margin probe (0.08 -> 0.07 -> 0.06 -> 0.05)
+            # Second threshold: after 20s, use a fixed reduced safety margin for 5 waypoints, then restore
             if fail_elapsed >= 20.0:
                 try:
-                    # Initialize probe sequence if not already active
+                    # Initialize fixed probe if not already active
                     if not self._safety_probe_active:
-                        # Save original margin for restoration later
+                        # Save original margin for restoration later and apply fixed margin
                         self._safety_margin_saved = self.safety_margin
-                        # Generate candidates from 0.08 down to 0.00 in 0.01 steps (inclusive)
-                        base_candidates = [round(0.08 - 0.01 * i, 3) for i in range(9)]  # 0.08..0.00
-                        # Only try candidates lower than the default margin to avoid increasing it
-                        default_margin = float(self._safety_margin_default)
-                        self._safety_probe_candidates = [m for m in base_candidates if m < default_margin]
-                        # Fallback: if default already low, at least try one step lower (but not below 0.05)
-                        if not self._safety_probe_candidates:
-                            next_step = max(0.05, round(default_margin - 0.01, 3))
-                            print(f"Safety Margin {next_step}")
-                            if next_step < default_margin:
-                                self._safety_probe_candidates = [next_step]
-                        self._safety_probe_index = 0
-                        if self._safety_probe_candidates:
-                            self.safety_margin = float(self._safety_probe_candidates[self._safety_probe_index])
-                            self._safety_probe_active = True
-                            # Use waypoint-based window: keep reduced margin for 5 waypoint arrivals
-                            self._safety_probe_waypoints_left = 5
-                            # Start per-candidate timer
-                            self._safety_probe_candidate_start = now_fail
-                            # Cancel any ongoing covariance spin and suppress while probing
-                            if self._cov_spin_until is not None:
-                                self._cov_spin_until = None
-                                self._cov_spin_start = None
-                            # Also set a short cooldown to prevent immediate re-trigger of cov spin
-                            try:
-                                self._cov_cooldown_until = time.time() + max(2.0, self.cov_spin_cooldown)
-                            except Exception:
-                                pass
-                            self.notification = f"Planning failed >20s: trying safety margin {self.safety_margin:.3f} for 5 waypoints"
-                            # Attempt an immediate replan with the first candidate margin
-                            if self.active:
-                                self.replan(initial=False)
-                                self.pick_next_goal()
-                                return
-                    else:
-                        # We are already probing — only step to the next candidate if its time budget elapsed
-                        elapsed_candidate = now_fail - float(self._safety_probe_candidate_start or now_fail)
-                        if elapsed_candidate >= float(self.safety_probe_candidate_max_secs):
-                            if 0 <= self._safety_probe_index < len(self._safety_probe_candidates) - 1:
-                                self._safety_probe_index += 1
-                                self.safety_margin = float(self._safety_probe_candidates[self._safety_probe_index])
-                                self._safety_probe_candidate_start = now_fail
-                                self.notification = f"Planning failed: stepping probe to safety margin {self.safety_margin:.3f}"
-                                if self.active:
-                                    self.replan(initial=False)
-                                    self.pick_next_goal()
-                                    return
-                        else:
-                            # Exhausted all candidates; restore margin and end probe window
-                            restore_to = float(self._safety_margin_default)
-                            self.safety_margin = restore_to
-                            self._safety_probe_active = False
-                            self._safety_probe_candidates = []
-                            self._safety_probe_index = -1
-                            self.notification = 'Planning failed: all probe margins exhausted — restoring safety margin'
+                        self.safety_margin = 0.045
+                        try:
+                            print(f"SAfety Margin this: {float(self.safety_margin):.3f}", flush=True)
+                        except Exception:
+                            pass
+                        self._safety_probe_active = True
+                        # Keep reduced margin for 5 waypoint arrivals
+                        self._safety_probe_waypoints_left = 5
+                        # Record start time (not used for stepping anymore but kept for diagnostics)
+                        self._safety_probe_candidate_start = now_fail
+                        # Cancel any ongoing covariance spin and suppress while probing
+                        if self._cov_spin_until is not None:
+                            self._cov_spin_until = None
+                            self._cov_spin_start = None
+                        try:
+                            self._cov_cooldown_until = time.time() + max(2.0, self.cov_spin_cooldown)
+                        except Exception:
+                            pass
+                        self.notification = f"Planning failed >20s: using safety margin {self.safety_margin:.3f} for 5 waypoints"
+                        # Immediate replan with fixed reduced margin
+                        if self.active:
+                            self.replan(initial=False)
+                            self.pick_next_goal()
+                            return
+                    # If already probing, do nothing here; restoration handled on waypoint arrivals
                 except Exception:
                     pass
 
@@ -2412,7 +2444,7 @@ if __name__ == "__main__":
     parser.add_argument("--list", type=str, default="")
     parser.add_argument("--grid_res", type=float, default=0.02)
     parser.add_argument("--robot_radius", type=float, default=0.12)
-    parser.add_argument("--safety_margin", type=float, default=0.098)
+    parser.add_argument("--safety_margin", type=float, default=0.099)
     # Merge threshold (main option). You can also use --merge_thresh alias below
     parser.add_argument("--merge_threshold", type=float, default=0.35,
                         help="Merge radius (meters) for clustering detections of the same fruit label")
