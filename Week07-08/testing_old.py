@@ -279,9 +279,12 @@ class AutoOperateDynamic(Operate):
         self._fruit_align_start = None
         self._fruit_align_pulse_start = None
         self._fruit_align_spin_dir = 1
+        # Max time to spend trying to center a target fruit before skipping (seconds)
+        self.fruit_align_max_time = 45.0
+        self._fruit_align_enter_time = None
         # Track last-centered time per base label (updated by perception)
-        self._last_centered_label_time: Dict[str, float] = {}
-    # Observe-only alignment for non-target fruits (center and dwell without navigating)
+        self._last_centered_label_time = {}
+        # Observe-only alignment for non-target fruits (center and dwell without navigating)
         self.enable_observe_align = True
         self.observe_align_duration = float(self.fruit_align_duration)
         self._observe_align_start = None
@@ -508,6 +511,7 @@ class AutoOperateDynamic(Operate):
         # Enter alignment phase first: center the fruit and dwell before navigating
         self._fruit_align_start = None
         self._fruit_align_pulse_start = None
+        self._fruit_align_enter_time = time.time()
         self._mode = 'fruit_align'
         self.notification = f"Aligning to fruit: {self.remaining_labels[0]} (center + {self.fruit_align_duration:.0f}s)"
         # Start deadline timer for reaching this fruit
@@ -557,6 +561,7 @@ class AutoOperateDynamic(Operate):
         # Enter alignment phase first: center the fruit and dwell before navigating
         self._fruit_align_start = None
         self._fruit_align_pulse_start = None
+        self._fruit_align_enter_time = time.time()
         self._mode = 'fruit_align'
         self._detour_active = True
         # Start deadline timer for reaching this fruit (detour)
@@ -1375,6 +1380,59 @@ class AutoOperateDynamic(Operate):
         if (self.enable_fruit_visits or self.enable_opportunistic_detours) and self._mode == 'fruit_align':
             try:
                 now_align = time.time()
+                # If taking too long to center, skip this fruit and move on
+                try:
+                    enter_t = float(self._fruit_align_enter_time or now_align)
+                    if (now_align - enter_t) >= float(self.fruit_align_max_time):
+                        lbl_timeout = None
+                        try:
+                            if self.remaining_labels:
+                                lbl_timeout = self.remaining_labels[0]
+                        except Exception:
+                            pass
+                        self._announce(f"Centering timed out (45s): skipping {lbl_timeout or 'fruit'}")
+                        # Remove from front of queue if it matches
+                        try:
+                            if self._fruit_visit_queue and lbl_timeout:
+                                if str(self._fruit_visit_queue[0].get('label','')).lower() == str(lbl_timeout).lower():
+                                    self._fruit_visit_queue.pop(0)
+                        except Exception:
+                            pass
+                        # Clear alignment state
+                        self._fruit_align_pulse_start = None
+                        self._fruit_align_start = None
+                        self._fruit_align_enter_time = None
+                        # If detouring, restore patrol state; else try next fruit or resume patrol
+                        if self._detour_active and self._saved_patrol_state is not None:
+                            try:
+                                st = self._saved_patrol_state
+                                self.remaining_targets = [list(t) for t in (st.get('remaining_targets') or [])] or self.remaining_targets
+                                self.remaining_labels = list(st.get('remaining_labels') or self.remaining_labels)
+                                self.waypoints = []
+                                self.current_goal = None
+                                self._mode = 'patrol'
+                                self._pending_patrol_advance = bool(st.get('pending_patrol_advance', False))
+                                self._detour_active = False
+                                self.replan(initial=False)
+                                self.pick_next_goal()
+                            except Exception:
+                                self._mode = 'patrol'
+                            finally:
+                                self._saved_patrol_state = None
+                        else:
+                            if self._start_next_fruit_target():
+                                return
+                            else:
+                                self._mode = 'patrol'
+                                # If patrol was pending advance, keep that behavior; otherwise just replan
+                                try:
+                                    self.replan(initial=False)
+                                    self.pick_next_goal()
+                                except Exception:
+                                    pass
+                        return
+                except Exception:
+                    pass
                 base = self._fruit_target_label_base
                 centered_recent = False
                 if base is not None:
@@ -1414,6 +1472,7 @@ class AutoOperateDynamic(Operate):
                         pass
                     self.pick_next_goal()
                     self._mode = 'fruit_nav'
+                    self._fruit_align_enter_time = None
                     self._fruit_align_pulse_start = None
                     self.notification = f"Heading to fruit: {self.remaining_labels[0]}"
                     return
@@ -1831,6 +1890,7 @@ class AutoOperateDynamic(Operate):
                         # Fallback: if default already low, at least try one step lower (but not below 0.05)
                         if not self._safety_probe_candidates:
                             next_step = max(0.05, round(default_margin - 0.01, 3))
+                            print(f"Safety Margin {next_step}")
                             if next_step < default_margin:
                                 self._safety_probe_candidates = [next_step]
                         self._safety_probe_index = 0
@@ -2120,6 +2180,85 @@ class AutoOperateDynamic(Operate):
             if merged:
                 # merged into an existing cluster; skip the rest of add process
                 continue
+
+            # --- Special cross-label merge rules (10 cm) ---
+            # If capsicum and tomato are within 10 cm, merge as capsicum.
+            # If lemon and orange are within 10 cm, merge as orange.
+            try:
+                preferred_map = {
+                    ('capsicum', 'tomato'): 'capsicum',
+                    ('tomato', 'capsicum'): 'capsicum',
+                    ('lemon', 'orange'): 'orange',
+                    ('orange', 'lemon'): 'orange',
+                }
+                base_new = label.rsplit('_', 1)[0] if ('_' in label and label.rsplit('_',1)[1].isdigit()) else label
+                did_special_merge = False
+                for d in self.discovered_obstacles:
+                    existing_label = str(d.get('label', ''))
+                    base_existing = existing_label.rsplit('_', 1)[0] if ('_' in existing_label and existing_label.rsplit('_',1)[1].isdigit()) else existing_label
+                    pref = preferred_map.get((base_existing, base_new))
+                    if not pref:
+                        continue
+                    px, py = float(d.get('x', 0.0)), float(d.get('y', 0.0))
+                    dist_xy = math.hypot(ox - px, oy - py)
+                    if dist_xy <= 0.10:
+                        # Update the obstacle position using KF-like update when possible
+                        moved = 0.0
+                        try:
+                            if 'P' not in d or not isinstance(d['P'], np.ndarray) or d['P'].shape != (2, 2):
+                                d['P'] = np.diag([0.04, 0.04])
+                            P_prev = d['P']
+                            Q = self.fruit_Q
+                            R = self.fruit_R
+                            P_pred = P_prev + Q
+                            z = np.array([ox, oy])
+                            x_prev_vec = np.array([px, py])
+                            S = P_pred + R
+                            K = P_pred @ np.linalg.inv(S)
+                            innovation = z - x_prev_vec
+                            x_new_vec = x_prev_vec + K @ innovation
+                            P_new = (np.eye(2) - K) @ P_pred
+                            new_x = float(x_new_vec[0])
+                            new_y = float(x_new_vec[1])
+                            moved = math.hypot(new_x - px, new_y - py)
+                            d['x'] = new_x
+                            d['y'] = new_y
+                            d['P'] = P_new
+                            d['count'] = int(d.get('count', 1)) + 1
+                            d['last_seen'] = now
+                            self._log_obstacle(new_x, new_y, label=pref, method='special-merge-kf')
+                            self._flush_log(force=False)
+                        except Exception:
+                            # Fallback smoothing update
+                            alpha = float(self.fruit_update_alpha)
+                            new_x = (1 - alpha) * px + alpha * ox
+                            new_y = (1 - alpha) * py + alpha * oy
+                            moved = math.hypot(new_x - px, new_y - py)
+                            d['x'] = new_x
+                            d['y'] = new_y
+                            d['count'] = int(d.get('count', 1)) + 1
+                            d['last_seen'] = now
+                            self._log_obstacle(new_x, new_y, label=pref, method='special-merge')
+                            self._flush_log(force=False)
+
+                        # Relabel obstacle to the preferred base if needed
+                        if base_existing != pref:
+                            try:
+                                idx_pref = int(self._fruit_label_counts.get(pref, 0))
+                                enum_pref = f"{pref}_{idx_pref}"
+                                self._fruit_label_counts[pref] = idx_pref + 1
+                                d['label'] = enum_pref
+                            except Exception:
+                                d['label'] = pref
+                        if moved > self.fruit_replan_move_thr:
+                            fruit_changed = True
+                        did_special_merge = True
+                        break
+                if did_special_merge:
+                    # We handled this detection via special merge; skip normal add/merge
+                    continue
+            except Exception:
+                pass
 
             # --- Cross-label merge: if a different fruit is within a small radius, update the first one ---
             # Prevents duplicate obstacles when two different labels are reported for the same physical fruit.
