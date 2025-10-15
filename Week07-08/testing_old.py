@@ -281,6 +281,15 @@ class AutoOperateDynamic(Operate):
         self._fruit_align_spin_dir = 1
         # Track last-centered time per base label (updated by perception)
         self._last_centered_label_time: Dict[str, float] = {}
+    # Observe-only alignment for non-target fruits (center and dwell without navigating)
+        self.enable_observe_align = True
+        self.observe_align_duration = float(self.fruit_align_duration)
+        self._observe_align_start = None
+        self._observe_align_pulse_start = None
+        self._observe_align_spin_dir = 1
+        self._observe_label_base = None
+        self._observe_label_display = None
+        self._observe_cooldown_until = 0.0
         # Fruit visit state
         self._fruit_visit_queue = []
         self._fruit_queue_last_sig = None  # track last queue signature to announce changes
@@ -1027,7 +1036,7 @@ class AutoOperateDynamic(Operate):
             now_cov = time.time()
             # Do not start or run covariance spin during fruit hold, fruit alignment, any emergency phase,
             # arrival (waypoint) spin, or safety-probe window
-            if (self._mode not in ('fruit_hold', 'fruit_align')) and getattr(self, '_emergency_mode', None) is None and self._arrival_spin_start is None and not self._safety_probe_active:
+            if (self._mode not in ('fruit_hold', 'fruit_align', 'observe_align')) and getattr(self, '_emergency_mode', None) is None and self._arrival_spin_start is None and not self._safety_probe_active:
                 # If currently spinning due to high covariance, keep spinning until timeout
                 if self._cov_spin_until is not None and now_cov < self._cov_spin_until:
                     # Pulsed behavior: rotate for cov_pulse_spin_time then stop for cov_pulse_stop_time
@@ -1071,6 +1080,57 @@ class AutoOperateDynamic(Operate):
                 self._cov_spin_deferred = True
         except Exception:
             pass
+
+        # Observe-only alignment state: center a newly-seen non-target fruit, dwell, then resume patrol
+        if self.enable_observe_align and self._mode == 'observe_align':
+            try:
+                now_obs = time.time()
+                base = self._observe_label_base
+                centered_recent = False
+                if base is not None:
+                    try:
+                        t_last = float(self._last_centered_label_time.get(base, 0.0))
+                        centered_recent = (now_obs - t_last) <= 0.5
+                    except Exception:
+                        centered_recent = False
+
+                if not centered_recent:
+                    # Not centered yet — keep pulse-spinning in place
+                    self._observe_align_start = None  # reset dwell timer
+                    if self._observe_align_pulse_start is None:
+                        self._observe_align_pulse_start = now_obs
+                    a_period = float(self.arrival_pulse_spin_time + self.arrival_pulse_stop_time)
+                    a_phase = (now_obs - self._observe_align_pulse_start) % a_period
+                    if a_phase < self.arrival_pulse_spin_time:
+                        self.command['motion'] = [0, self._observe_align_spin_dir * self.turn_cmd]
+                    else:
+                        self.command['motion'] = [0, 0]
+                    disp = self._observe_label_display or 'fruit'
+                    self.notification = f"Centering {disp} (observe)…"
+                    return
+
+                # Fruit centered: dwell (look at fruit) for observe_align_duration
+                if self._observe_align_start is None:
+                    self._observe_align_start = now_obs
+                    # flip spin direction next time we need to re-center
+                    self._observe_align_spin_dir *= -1
+                self.command['motion'] = [0, 0]
+                remaining = max(0.0, float(self.observe_align_duration) - (now_obs - float(self._observe_align_start or now_obs)))
+                disp = self._observe_label_display or 'fruit'
+                self.notification = f"Observing {disp} {remaining:.1f}s"
+                if (now_obs - float(self._observe_align_start or now_obs)) >= float(self.observe_align_duration):
+                    # Observation complete — resume patrol path (no replan required here)
+                    self._observe_align_pulse_start = None
+                    self._observe_align_start = None
+                    self._observe_label_base = None
+                    self._observe_label_display = None
+                    self._mode = 'patrol'
+                    self._observe_cooldown_until = now_obs + 8.0  # small cooldown before next observe
+                    self.notification = "Observation complete — resuming patrol"
+                    return
+                return
+            except Exception:
+                pass
 
         # Periodic calibration trigger (non-blocking start)
         try:
@@ -2151,6 +2211,21 @@ class AutoOperateDynamic(Operate):
             self.last_obstacle_add_time = now
             new_added = True
             fruit_changed = True
+
+            # If configured, briefly align/observe newly added non-target fruit to refine its position
+            try:
+                if self.enable_observe_align and self._mode == 'patrol' and not self._calib_mode and getattr(self, '_emergency_mode', None) is None:
+                    if time.time() >= float(self._observe_cooldown_until or 0.0):
+                        self._observe_label_base = base_label
+                        self._observe_label_display = enum_label
+                        self._observe_align_start = None
+                        self._observe_align_pulse_start = None
+                        # Alternate spin direction between observations to reduce bias
+                        self._observe_align_spin_dir *= -1
+                        self._mode = 'observe_align'
+                        self.notification = f"Observing {enum_label}: centering before resuming"
+            except Exception:
+                pass
 
         if fruit_changed:
             self._save_fruit_locations()
