@@ -144,7 +144,7 @@ class AutoOperateDynamic(Operate):
         # Detection handling
         self.last_obstacle_add_time = 0.0
         self.add_cooldown = 0.7  # seconds
-        self.min_obs_separation = 0.05  # m
+        self.min_obs_separation = 0.067  # m
     # If a different fruit label is observed within this radius of an existing fruit,
     # treat it as the same physical object and update the existing fruit instead of
     # creating a new one (helps collapse mislabels that are colocated).
@@ -266,6 +266,10 @@ class AutoOperateDynamic(Operate):
         # Fruit visit parameters
         self.fruit_visit_radius = 0.08  # meters (15cm; approach within this distance counts as visited)
         self.fruit_hold_duration = 5.0  # seconds to hold at fruit
+    # Per-fruit timeout (in seconds) – 6.7 minutes
+        self.fruit_target_timeout = 402.0
+        # Deadline timestamp for current fruit target (epoch seconds); 0 means inactive
+        self._fruit_target_deadline = 0.0
         # Fruit visit state
         self._fruit_visit_queue = []
         self._fruit_queue_last_sig = None  # track last queue signature to announce changes
@@ -466,6 +470,17 @@ class AutoOperateDynamic(Operate):
         self._fruit_target_xy = (fx, fy)
         self._fruit_target_label_base = self._base_label(lbl)
         self._fruit_target_last_update = time.time()
+        # Start per-fruit deadline
+        try:
+            self._fruit_target_deadline = time.time() + float(self.fruit_target_timeout)
+            try:
+                mins = int(self.fruit_target_timeout // 60)
+                secs = int(self.fruit_target_timeout % 60)
+                self._announce(f"Timer started for {lbl}: {mins}:{secs:02d}")
+            except Exception:
+                pass
+        except Exception:
+            self._fruit_target_deadline = 0.0
         self.waypoints = []
         self.current_goal = None
         try:
@@ -512,6 +527,17 @@ class AutoOperateDynamic(Operate):
         except Exception:
             self._fruit_target_label_base = flabel
         self._fruit_target_last_update = time.time()
+        # Start per-fruit deadline
+        try:
+            self._fruit_target_deadline = time.time() + float(self.fruit_target_timeout)
+            try:
+                mins = int(self.fruit_target_timeout // 60)
+                secs = int(self.fruit_target_timeout % 60)
+                self._announce(f"Timer started for {flabel}: {mins}:{secs:02d}")
+            except Exception:
+                pass
+        except Exception:
+            self._fruit_target_deadline = 0.0
         self.waypoints = []
         self.current_goal = None
         try:
@@ -627,6 +653,13 @@ class AutoOperateDynamic(Operate):
         slam_origin = (2 * h_pad + 320, v_pad)
         slam_res = (320, 480 + v_pad)
 
+        # Ensure we have a font even if initialization failed earlier
+        try:
+            if self.label_font is None:
+                self.label_font = pygame.font.SysFont(None, 14)
+        except Exception:
+            pass
+
         # We need a surface reference to draw onto; re-generate ekf view here to overlay
         ekf_view = self.ekf.draw_slam_state(res=(320, 480 + v_pad), not_pause=self.ekf_on)
 
@@ -729,6 +762,23 @@ class AutoOperateDynamic(Operate):
                 status_surf = self.label_font.render(status_msg, True, (255, 200, 0))
                 # place at top-left of ekf_view with small padding
                 ekf_view.blit(status_surf, (6, 6))
+
+            # Per-fruit timeout HUD: show remaining time during fruit_nav/fruit_hold when deadline active
+            try:
+                if float(getattr(self, '_fruit_target_deadline', 0.0)) > 0.0 and self.label_font is not None:
+                    remaining = max(0.0, float(self._fruit_target_deadline) - time.time())
+                    mins = int(remaining // 60)
+                    secs = int(remaining % 60)
+                    lbl = self.remaining_labels[0] if self.remaining_labels else 'fruit'
+                    text2 = f"{lbl} skip in {mins:01d}:{secs:02d}"
+                    hud = self.label_font.render(text2, True, (255, 255, 255))
+                    # Draw a subtle background rect for readability below the calib line
+                    y0 = 22
+                    bg_rect = pygame.Rect(6, y0, hud.get_width() + 6, hud.get_height() + 4)
+                    pygame.draw.rect(ekf_view, (0, 0, 0), bg_rect)
+                    ekf_view.blit(hud, (9, y0 + 2))
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1229,6 +1279,61 @@ class AutoOperateDynamic(Operate):
         # If we are navigating specifically to a fruit (opportunistic detours or queued visits)
         if (self.enable_fruit_visits or self.enable_opportunistic_detours) and self._mode == 'fruit_nav':
             try:
+                # Timeout enforcement: if deadline expired without holding, skip this fruit
+                if self._fruit_target_deadline and time.time() >= float(self._fruit_target_deadline):
+                    try:
+                        cur_lbl = self.remaining_labels[0] if self.remaining_labels else 'fruit'
+                        self._announce(f"Timeout — skipping {cur_lbl}")
+                    except Exception:
+                        pass
+                    # Clear deadline and any hold timer
+                    self._fruit_target_deadline = 0.0
+                    self._fruit_hold_start = None
+                    # Clear stored fruit target metadata
+                    self._fruit_target_xy = None
+                    self._fruit_target_label_base = None
+                    # Remove from queue front if this was a queued visit
+                    if self._fruit_visit_queue:
+                        try:
+                            front_lbl = str(self._fruit_visit_queue[0].get('label','')).lower()
+                            if self.remaining_labels and front_lbl == self.remaining_labels[0].lower():
+                                self._fruit_visit_queue.pop(0)
+                        except Exception:
+                            pass
+                    # Decide next action depending on detour vs queued visit
+                    if self._detour_active and self._saved_patrol_state is not None:
+                        try:
+                            st = self._saved_patrol_state
+                            self.remaining_targets = [list(t) for t in (st.get('remaining_targets') or [])] or self.remaining_targets
+                            self.remaining_labels = list(st.get('remaining_labels') or self.remaining_labels)
+                            self.waypoints = []
+                            self.current_goal = None
+                            self._mode = 'patrol'
+                            self._pending_patrol_advance = bool(st.get('pending_patrol_advance', False))
+                            self._detour_active = False
+                            try:
+                                if self.remaining_targets:
+                                    tx, ty = self.remaining_targets[0]
+                                    self._announce(f"Resuming patrol to ({tx:.2f},{ty:.2f})")
+                            except Exception:
+                                pass
+                            self.replan(initial=False)
+                            self.pick_next_goal()
+                        except Exception:
+                            self._mode = 'patrol'
+                        finally:
+                            self._saved_patrol_state = None
+                        return
+                    # Queued flow: try next fruit; otherwise resume patrol and advance if pending
+                    if self._fruit_visit_queue and self.enable_fruit_visits:
+                        if self._start_next_fruit_target():
+                            return
+                    else:
+                        self._mode = 'patrol'
+                        if self._pending_patrol_advance and not self._detour_active:
+                            self._pending_patrol_advance = False
+                            self._advance_target()
+                        return
                 # Use the actual fruit target position (not intermediate waypoints)
                 if self._fruit_target_xy is not None:
                     fx, fy = self._fruit_target_xy
@@ -1241,6 +1346,8 @@ class AutoOperateDynamic(Operate):
                     # Reached fruit: enter hold
                     if self._fruit_hold_start is None:
                         self._fruit_hold_start = time.time()
+                        # Clear the deadline once we begin holding at the fruit
+                        self._fruit_target_deadline = 0.0
                         self.notification = f"At fruit {self.remaining_labels[0]} holding"
                         self.command['motion'] = [0, 0]
                         self._mode = 'fruit_hold'
@@ -1923,8 +2030,8 @@ if __name__ == "__main__":
     parser.add_argument("--map", type=str, default="")
     parser.add_argument("--list", type=str, default="")
     parser.add_argument("--grid_res", type=float, default=0.02)
-    parser.add_argument("--robot_radius", type=float, default=0.11)
-    parser.add_argument("--safety_margin", type=float, default=0.097)
+    parser.add_argument("--robot_radius", type=float, default=0.12)
+    parser.add_argument("--safety_margin", type=float, default=0.098)
     # Merge threshold (main option). You can also use --merge_thresh alias below
     parser.add_argument("--merge_threshold", type=float, default=0.35,
                         help="Merge radius (meters) for clustering detections of the same fruit label")
