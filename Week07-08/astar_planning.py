@@ -186,10 +186,6 @@ def grid_to_world(ix, iy, bounds, res):
 
 
 def build_occupancy(obstacles_xy, bounds, res, inflation_radius):
-    """Legacy occupancy builder: uses a single inflation radius for all obstacles.
-
-    Kept for backward compatibility; prefer build_occupancy_mixed for per-obstacle radii.
-    """
     minx, miny, maxx, maxy = bounds
     w = int(math.ceil((maxx - minx) / res)) + 1
     h = int(math.ceil((maxy - miny) / res)) + 1
@@ -197,33 +193,6 @@ def build_occupancy(obstacles_xy, bounds, res, inflation_radius):
     r_cells = int(math.ceil(inflation_radius / res))
     for (ox, oy) in obstacles_xy:
         cx, cy = world_to_grid(ox, oy, bounds, res)
-        x0, x1 = max(0, cx - r_cells), min(w - 1, cx + r_cells)
-        y0, y1 = max(0, cy - r_cells), min(h - 1, cy + r_cells)
-        for ix in range(x0, x1 + 1):
-            for iy in range(y0, y1 + 1):
-                if (ix - cx) ** 2 + (iy - cy) ** 2 <= r_cells ** 2:
-                    grid[ix, iy] = 1
-    return grid
-
-
-def build_occupancy_mixed(obstacles_xy, bounds, res, default_radius):
-    """Build occupancy with per-obstacle inflation radii.
-
-    obstacles_xy entries can be either [x, y] (uses default_radius) or [x, y, r] (uses r).
-    """
-    minx, miny, maxx, maxy = bounds
-    w = int(math.ceil((maxx - minx) / res)) + 1
-    h = int(math.ceil((maxy - miny) / res)) + 1
-    grid = np.zeros((w, h), dtype=np.uint8)
-    for ob in obstacles_xy:
-        if isinstance(ob, (list, tuple)) and len(ob) >= 2:
-            ox, oy = float(ob[0]), float(ob[1])
-            r = float(ob[2]) if (len(ob) >= 3) else float(default_radius)
-        else:
-            # skip malformed
-            continue
-        cx, cy = world_to_grid(ox, oy, bounds, res)
-        r_cells = int(math.ceil(r / res))
         x0, x1 = max(0, cx - r_cells), min(w - 1, cx + r_cells)
         y0, y1 = max(0, cy - r_cells), min(h - 1, cy + r_cells)
         for ix in range(x0, x1 + 1):
@@ -371,13 +340,8 @@ def sparsify_path_collision_aware(world_pts, obstacles_xy, clearance_radius, ang
             bx, by = prelim[j]
             # Check segment clearance against all obstacles
             clear = True
-            for ob in obstacles_xy:
-                if isinstance(ob, (list, tuple)) and len(ob) >= 2:
-                    ox, oy = float(ob[0]), float(ob[1])
-                    r = float(ob[2]) if (len(ob) >= 3) else float(clearance_radius)
-                else:
-                    continue
-                if _seg_point_min_dist(ax, ay, bx, by, ox, oy) < r:
+            for (ox, oy) in obstacles_xy:
+                if _seg_point_min_dist(ax, ay, bx, by, float(ox), float(oy)) < clearance_radius:
                     clear = False
                     break
             if clear:
@@ -416,9 +380,7 @@ def plan_waypoints(robot_xy, targets_xy, obstacles_xy, grid_res=0.02, robot_radi
     """
     all_pts = obstacles_xy + targets_xy + [robot_xy]
     bounds = infer_bounds(all_pts, margin=0.25)
-    default_clearance = float(robot_radius + safety_margin)
-    # Support per-obstacle radii (elements may be [x,y] or [x,y,r])
-    grid = build_occupancy_mixed(obstacles_xy, bounds, grid_res, default_clearance)
+    grid = build_occupancy(obstacles_xy, bounds, grid_res, robot_radius + safety_margin)
 
     waypoints = []
     cur_xy = robot_xy
@@ -431,7 +393,8 @@ def plan_waypoints(robot_xy, targets_xy, obstacles_xy, grid_res=0.02, robot_radi
         world_path = [list(grid_to_world(ix, iy, bounds, grid_res)) for (ix, iy) in path]
 
         # Sparsify path but ensure segments maintain clearance from obstacles
-        sparse = sparsify_path_collision_aware(world_path, obstacles_xy, default_clearance, angle_eps_deg=5.0)
+        clearance = float(robot_radius + safety_margin)
+        sparse = sparsify_path_collision_aware(world_path, obstacles_xy, clearance, angle_eps_deg=5.0)
 
         # Ensure last point is exactly the true target coordinates (avoid grid center quantization)
         if len(sparse) >= 1:
