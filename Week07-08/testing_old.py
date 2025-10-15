@@ -334,6 +334,12 @@ class AutoOperateDynamic(Operate):
         # Waypoint-based probe control (new)
         self._safety_probe_waypoints_left = 0
         self._wp_counted = False
+        # Stepwise safety probe candidates and index (filled on demand after 20s of failures)
+        self._safety_probe_candidates = []
+        self._safety_probe_index = -1
+        # Per-candidate time budget (seconds) and start time
+        self.safety_probe_candidate_max_secs = 6.0
+        self._safety_probe_candidate_start = 0.0
 
     def _save_fruit_locations(self):
         """Persist fruit obstacle locations as enumerated JSON mapping.
@@ -1750,23 +1756,62 @@ class AutoOperateDynamic(Operate):
                     self._cov_spin_start = now_fail
                     self.notification = 'Planning failed for 10s: starting stabilizing spin'
                     # Do not reset plan fail timer yet; allow it to continue accruing toward skip
-            # Second threshold: for a brief window, reduce safety margin to try finding a path
-            if fail_elapsed >= 20.0 and not self._safety_probe_active:
+            # Second threshold: after 20s, try a stepwise safety margin probe (0.08 -> 0.07 -> 0.06 -> 0.05)
+            if fail_elapsed >= 20.0:
                 try:
-                    self._safety_margin_saved = self.safety_margin
-                    self.safety_margin = 0.045
-                    self._safety_probe_active = True
-                    # Start waypoint-based probe (5 waypoints)
-                    self._safety_probe_waypoints_left = 5
-                    # Cancel any ongoing covariance spin and suppress while probing
-                    if self._cov_spin_until is not None:
-                        self._cov_spin_until = None
-                        self._cov_spin_start = None
-                    self.notification = 'Planning failed >20s: reduced safety margin for 5 waypoints'
-                    # Attempt an immediate replan with reduced margin
-                    if self.active:
-                        self.replan(initial=False)
-                        self.pick_next_goal()
+                    # Initialize probe sequence if not already active
+                    if not self._safety_probe_active:
+                        # Save original margin for restoration later
+                        self._safety_margin_saved = self.safety_margin
+                        # Generate candidates from 0.08 down to 0.00 in 0.01 steps (inclusive)
+                        base_candidates = [round(0.08 - 0.01 * i, 3) for i in range(9)]  # 0.08..0.00
+                        # Only try candidates lower than the default margin to avoid increasing it
+                        default_margin = float(self._safety_margin_default)
+                        self._safety_probe_candidates = [m for m in base_candidates if m < default_margin]
+                        # Fallback: if default already low, at least try one step lower (but not below 0.05)
+                        if not self._safety_probe_candidates:
+                            next_step = max(0.05, round(default_margin - 0.01, 3))
+                            if next_step < default_margin:
+                                self._safety_probe_candidates = [next_step]
+                        self._safety_probe_index = 0
+                        if self._safety_probe_candidates:
+                            self.safety_margin = float(self._safety_probe_candidates[self._safety_probe_index])
+                            self._safety_probe_active = True
+                            # Use waypoint-based window: keep reduced margin for 5 waypoint arrivals
+                            self._safety_probe_waypoints_left = 5
+                            # Start per-candidate timer
+                            self._safety_probe_candidate_start = now_fail
+                            # Cancel any ongoing covariance spin and suppress while probing
+                            if self._cov_spin_until is not None:
+                                self._cov_spin_until = None
+                                self._cov_spin_start = None
+                            self.notification = f"Planning failed >20s: trying safety margin {self.safety_margin:.3f} for 5 waypoints"
+                            # Attempt an immediate replan with the first candidate margin
+                            if self.active:
+                                self.replan(initial=False)
+                                self.pick_next_goal()
+                                return
+                    else:
+                        # We are already probing — only step to the next candidate if its time budget elapsed
+                        elapsed_candidate = now_fail - float(self._safety_probe_candidate_start or now_fail)
+                        if elapsed_candidate >= float(self.safety_probe_candidate_max_secs):
+                            if 0 <= self._safety_probe_index < len(self._safety_probe_candidates) - 1:
+                                self._safety_probe_index += 1
+                                self.safety_margin = float(self._safety_probe_candidates[self._safety_probe_index])
+                                self._safety_probe_candidate_start = now_fail
+                                self.notification = f"Planning failed: stepping probe to safety margin {self.safety_margin:.3f}"
+                                if self.active:
+                                    self.replan(initial=False)
+                                    self.pick_next_goal()
+                                    return
+                        else:
+                            # Exhausted all candidates; restore margin and end probe window
+                            restore_to = float(self._safety_margin_default)
+                            self.safety_margin = restore_to
+                            self._safety_probe_active = False
+                            self._safety_probe_candidates = []
+                            self._safety_probe_index = -1
+                            self.notification = 'Planning failed: all probe margins exhausted — restoring safety margin'
                 except Exception:
                     pass
 
