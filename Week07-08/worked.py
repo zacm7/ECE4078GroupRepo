@@ -71,7 +71,7 @@ class AutoOperateDynamic(Operate):
 
         # --- Patrol model (replaces partial map targets) ---
         # Default sequence; robot assumed to start near (0,0).
-        default_patrol = [(-0.65, 0.65), (-0.65, -0.65), (0.65, -0.65), (0.65, 0.65)]
+        default_patrol = [(-0.65, 0.65), (-0.70, -0.70), (0.75, -0.75), (0.80, 0.80)]
         pts: List[Tuple[float, float]] = []
         if patrol_points:
             pts = [(float(a), float(b)) for (a, b) in patrol_points]
@@ -176,6 +176,9 @@ class AutoOperateDynamic(Operate):
         # Covariance-based stabilize spin parameters
         self.cov_pos_thresh = 0.14      # trigger threshold on P[0,0]
         self.cov_spin_duration = 9.0      # seconds to spin when triggered (increased from 6s)
+        # Grace window after arrival spin to allow fruit detections to be added before we decide to advance patrol
+        self.post_spin_grace = 0.6  # seconds to wait after spin for fruit queue to populate
+        self._post_spin_grace_until = 0.0
         self.cov_spin_cooldown = 3.0      # seconds to wait before checking again
         self._cov_spin_until = None       # type: ignore[assignment]
         self._cov_cooldown_until = 0.0
@@ -184,6 +187,12 @@ class AutoOperateDynamic(Operate):
         self.cov_pulse_spin_time = 0.4
         self.cov_pulse_stop_time = 0.2
         self._cov_spin_start = None       # type: ignore[assignment]
+        # Do not perform covariance spin while holding at a fruit; defer until after hold
+        self._cov_spin_deferred = False
+
+    # Post-hold reverse behavior
+        self.fruit_post_hold_reverse_time = 0.7  # seconds to reverse after holding at a fruit
+        self._fruit_post_reverse_until = 0.0
 
         # Navigation pulse timing (normal turn/drive):
         # - Turning: spin 0.4s, stop 0.2s (same as covariance spin)
@@ -259,6 +268,7 @@ class AutoOperateDynamic(Operate):
         self.fruit_hold_duration = 5.0  # seconds to hold at fruit
         # Fruit visit state
         self._fruit_visit_queue = []
+        self._fruit_queue_last_sig = None  # track last queue signature to announce changes
         self._fruit_hold_start = None
         self._visited_fruits_cycle = set()  # enumerated labels visited in current patrol leg
     # Persistent record of visited fruit base labels (e.g., 'potato') for the entire run
@@ -302,6 +312,8 @@ class AutoOperateDynamic(Operate):
         # Safety margin probe when planning is stuck: temporarily reduce margin and try
         self._safety_probe_active = False
         self._safety_probe_until = 0.0
+        # Duration to keep reduced safety margin active (seconds)
+        self.safety_probe_duration = 9.0
 
     def _save_fruit_locations(self):
         """Persist fruit obstacle locations as enumerated JSON mapping.
@@ -377,6 +389,13 @@ class AutoOperateDynamic(Operate):
         self._fruit_visit_queue = []
         try:
             if not self.shopping_list:
+                # Announce cleared queue if it was previously non-empty
+                try:
+                    if getattr(self, '_fruit_queue_last_sig', None) not in (None, ()):  # type: ignore[comparison-overlap]
+                        self._fruit_queue_last_sig = ()
+                        self._announce("Fruit queue cleared")
+                except Exception:
+                    pass
                 return
             x, y, _ = self.get_pose()
             candidates: List[tuple[float, dict]] = []
@@ -400,9 +419,34 @@ class AutoOperateDynamic(Operate):
                 except Exception:
                     continue
             if not candidates:
+                # Announce cleared queue if it was previously non-empty
+                try:
+                    if getattr(self, '_fruit_queue_last_sig', None) not in (None, ()):  # type: ignore[comparison-overlap]
+                        self._fruit_queue_last_sig = ()
+                        self._announce("Fruit queue cleared")
+                except Exception:
+                    pass
                 return
             candidates.sort(key=lambda t: t[0])
             self._fruit_visit_queue = [d for _, d in candidates]
+            # Build a change signature based on base labels (order-insensitive) and announce
+            try:
+                sig = tuple(sorted([self._base_label(str(d.get('label', '')).lower()) for d in self._fruit_visit_queue]))
+                if sig != getattr(self, '_fruit_queue_last_sig', None):
+                    self._fruit_queue_last_sig = sig
+                    parts = []
+                    for d in self._fruit_visit_queue:
+                        try:
+                            lbl = str(d.get('label', ''))
+                            fx = float(d.get('x', 0.0)); fy = float(d.get('y', 0.0))
+                            dist = math.hypot(fx - x, fy - y)
+                            parts.append(f"{lbl}@{dist:.2f}m")
+                        except Exception:
+                            continue
+                    summary = ", ".join(parts)
+                    self._announce(f"Fruit queue updated ({len(self._fruit_visit_queue)}): {summary}")
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -433,6 +477,10 @@ class AutoOperateDynamic(Operate):
         self.pick_next_goal()
         self._mode = 'fruit_nav'
         self.notification = f"Heading to fruit: {self.remaining_labels[0]}"
+        try:
+            self._announce(f"Visiting fruit: {self.remaining_labels[0]} at ({fx:.2f},{fy:.2f})")
+        except Exception:
+            pass
         return True
 
     def _start_detour_to_fruit(self, fruit_dict: dict) -> bool:
@@ -479,6 +527,10 @@ class AutoOperateDynamic(Operate):
         self._arrival_spin_start = None
         self._arrival_spin_pulse_start = None
         self.notification = f"Heading to {flabel} (detour)"
+        try:
+            self._announce(f"Detouring to fruit: {flabel} at ({fx:.2f},{fy:.2f})")
+        except Exception:
+            pass
         return True
 
     def get_fruit_locations(self) -> List[Tuple[str, float, float]]:
@@ -557,6 +609,13 @@ class AutoOperateDynamic(Operate):
         self.current_goal = self.waypoints.pop(0)
         self.reached_time = None
         self.notification = f'Navigating to: [{self.current_goal[0]:.2f}, {self.current_goal[1]:.2f}]'
+
+    # --- Terminal announcement helper ---
+    def _announce(self, msg: str) -> None:
+        try:
+            print(msg, flush=True)
+        except Exception:
+            pass
 
     # --- Live overlay on SLAM panel ---
     def draw(self, canvas):
@@ -853,44 +912,79 @@ class AutoOperateDynamic(Operate):
                 self._initial_spin_start = None
                 self._initial_spin_done = True
 
+        # --- Short reverse after finishing a fruit hold (preempts other actions) ---
+        try:
+            now_rev = time.time()
+            if self._fruit_post_reverse_until and now_rev < float(self._fruit_post_reverse_until):
+                remaining = float(self._fruit_post_reverse_until) - now_rev
+                self.command['motion'] = [-self.fwd_cmd, 0]
+                self.notification = f'Post-hold reverse ({remaining:.1f}s)'
+                return
+            elif self._fruit_post_reverse_until and now_rev >= float(self._fruit_post_reverse_until):
+                # Reverse phase finished; clear and, if covariance is high, trigger stabilizing spin now
+                self._fruit_post_reverse_until = 0.0
+                try:
+                    P = getattr(self.ekf, 'P', None)
+                    if isinstance(P, np.ndarray) and P.shape[0] >= 2 and P.shape[1] >= 2 and self._mode != 'fruit_hold' and self._arrival_spin_start is None:
+                        pxx = float(P[0, 0])
+                        if pxx > float(self.cov_pos_thresh):
+                            now_cov = time.time()
+                            self._cov_spin_dir = -self._cov_spin_dir
+                            self._cov_spin_until = now_cov + float(self.cov_spin_duration)
+                            self._cov_spin_start = now_cov
+                            self.notification = 'High covariance after reverse: stabilizing spin'
+                            # Do not return here; allow the normal cov block below to handle pulsing/return
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # --- High covariance stabilize spin (preempts other actions) ---
         try:
             now_cov = time.time()
-            # If currently spinning due to high covariance, keep spinning until timeout
-            if self._cov_spin_until is not None and now_cov < self._cov_spin_until:
-                # Pulsed behavior: rotate for cov_pulse_spin_time then stop for cov_pulse_stop_time
-                if self._cov_spin_start is None:
-                    self._cov_spin_start = now_cov
-                period = float(self.cov_pulse_spin_time + self.cov_pulse_stop_time)
-                phase = (now_cov - self._cov_spin_start) % period
-                if phase < self.cov_pulse_spin_time:
-                    self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
-                    self.notification = 'High covariance: stabilizing spin'
-                else:
-                    self.command['motion'] = [0, 0]
-                    self.notification = 'High covariance: stabilizing spin (pulse stop)'
-                return
-            # If a spin just finished, start cooldown timer and resume
-            if self._cov_spin_until is not None and now_cov >= self._cov_spin_until:
-                self._cov_spin_until = None
-                self._cov_spin_start = None
-                self._cov_cooldown_until = now_cov + self.cov_spin_cooldown
-            # If in cooldown, skip covariance checks
-            if now_cov < self._cov_cooldown_until:
-                pass  # proceed with normal behavior
-            else:
-                # Check EKF position covariance P[0,0]
-                P = getattr(self.ekf, 'P', None)
-                if isinstance(P, np.ndarray) and P.shape[0] >= 2 and P.shape[1] >= 2:
-                    pxx = float(P[0, 0])
-                    if pxx > float(self.cov_pos_thresh):
-                        # trigger spin
-                        self._cov_spin_dir = -self._cov_spin_dir  # alternate direction
-                        self._cov_spin_until = now_cov + float(self.cov_spin_duration)
+            # Do not start or run covariance spin during fruit hold, any emergency phase, arrival (waypoint) spin, or safety-probe window
+            if self._mode != 'fruit_hold' and getattr(self, '_emergency_mode', None) is None and self._arrival_spin_start is None and not self._safety_probe_active:
+                # If currently spinning due to high covariance, keep spinning until timeout
+                if self._cov_spin_until is not None and now_cov < self._cov_spin_until:
+                    # Pulsed behavior: rotate for cov_pulse_spin_time then stop for cov_pulse_stop_time
+                    if self._cov_spin_start is None:
                         self._cov_spin_start = now_cov
+                    period = float(self.cov_pulse_spin_time + self.cov_pulse_stop_time)
+                    phase = (now_cov - self._cov_spin_start) % period
+                    if phase < self.cov_pulse_spin_time:
                         self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
                         self.notification = 'High covariance: stabilizing spin'
-                        return
+                    else:
+                        self.command['motion'] = [0, 0]
+                        self.notification = 'High covariance: stabilizing spin (pulse stop)'
+                    return
+                # If a spin just finished, start cooldown timer and resume
+                if self._cov_spin_until is not None and now_cov >= self._cov_spin_until:
+                    self._cov_spin_until = None
+                    self._cov_spin_start = None
+                    self._cov_cooldown_until = now_cov + self.cov_spin_cooldown
+                # If in cooldown, skip covariance checks
+                if now_cov < self._cov_cooldown_until:
+                    pass  # proceed with normal behavior
+                else:
+                    # Check EKF position covariance P[0,0]
+                    P = getattr(self.ekf, 'P', None)
+                    if isinstance(P, np.ndarray) and P.shape[0] >= 2 and P.shape[1] >= 2 and self._arrival_spin_start is None:
+                        pxx = float(P[0, 0])
+                        if pxx > float(self.cov_pos_thresh):
+                            # trigger spin
+                            self._cov_spin_dir = -self._cov_spin_dir  # alternate direction
+                            self._cov_spin_until = now_cov + float(self.cov_spin_duration)
+                            self._cov_spin_start = now_cov
+                            self.command['motion'] = [0, self._cov_spin_dir * self.turn_cmd]
+                            self.notification = 'High covariance: stabilizing spin'
+                            return
+            else:
+                # While holding at fruit OR in emergency OR arrival spin OR safety-probe: cancel any ongoing covariance spin and defer
+                if self._cov_spin_until is not None:
+                    self._cov_spin_until = None
+                    self._cov_spin_start = None
+                self._cov_spin_deferred = True
         except Exception:
             pass
 
@@ -951,6 +1045,19 @@ class AutoOperateDynamic(Operate):
                 self._emergency_cooldown_until = now + float(self.emergency_cooldown)
                 self._emergency_until = 0.0
                 self._emergency_replan_triggered = False
+                # After emergency finishes, if covariance is high, trigger stabilizing spin now
+                try:
+                    P = getattr(self.ekf, 'P', None)
+                    if isinstance(P, np.ndarray) and P.shape[0] >= 2 and P.shape[1] >= 2:
+                        pxx = float(P[0, 0])
+                        if pxx > float(self.cov_pos_thresh):
+                            now_cov2 = time.time()
+                            self._cov_spin_dir = -self._cov_spin_dir
+                            self._cov_spin_until = now_cov2 + float(self.cov_spin_duration)
+                            self._cov_spin_start = now_cov2
+                            self.notification = 'High covariance after emergency: stabilizing spin'
+                except Exception:
+                    pass
 
             # Active emergency phase handling
             if self._emergency_mode in ('prestop', 'reverse', 'hold') and self._emergency_until > now:
@@ -1088,53 +1195,30 @@ class AutoOperateDynamic(Operate):
         except Exception:
             pass
 
-        # Opportunistic detours: while patrolling, if a shopping-list fruit is visible, detour
+        # Opportunistic detours: while patrolling, only detour to fruits that are already mapped
         if self.enable_opportunistic_detours and self._mode == 'patrol':
             try:
-                bboxes = getattr(self, 'detector_output', None)
-                if isinstance(bboxes, (list, tuple)) and self.shopping_list:
-                    # find best matching detection that projects within obs_max_range
-                    x, y, th = self.get_pose()
+                if self.shopping_list:
+                    x, y, _ = self.get_pose()
                     best = None
                     best_dist = 1e9
-                    for det in bboxes:
+                    for d in self.discovered_obstacles:
                         try:
-                            label = str(det[0]).lower()
-                            if label.startswith('aruco'):
+                            lbl = str(d.get('label', '')).lower()
+                            if lbl.startswith('aruco'):
                                 continue
-                            base = self._base_label(label)
+                            base = self._base_label(lbl)
                             if base not in self.shopping_list:
                                 continue
                             if base in getattr(self, '_visited_fruit_bases', set()):
                                 continue
-                            xywh = np.asarray(det[1]).astype(float)
-                            conf = float(det[2])
-                            if conf < 0.7:
-                                continue
-                            # Project to world (heuristic if TPE not available)
-                            ox, oy = None, None
-                            try:
-                                if estimate_pose is not None and self.K is not None:
-                                    obj_info = [label, [float(xywh[0]), float(xywh[1]), float(xywh[2]), float(xywh[3])]]
-                                    pd = estimate_pose(self.K, obj_info, [x, y, th])  # type: ignore[arg-type]
-                                    if pd and 'x' in pd and 'y' in pd:
-                                        ox = float(pd['x']); oy = float(pd['y'])
-                            except Exception:
-                                pass
-                            if ox is None or oy is None:
-                                u = float(xywh[0]); w_px = float(xywh[2])
-                                alpha = math.atan((u - self.cx) / max(1e-6, self.fx))
-                                bearing = th + alpha
-                                W_assumed = 0.10
-                                d = 0.5 if w_px <= 1.0 else max(0.35, min(1.10, (self.fx * W_assumed) / max(1.0, w_px)))
-                                ox = x + d * math.cos(bearing); oy = y + d * math.sin(bearing)
-                            rng = math.hypot(ox - x, oy - y)
+                            fx = float(d.get('x', 0.0)); fy = float(d.get('y', 0.0))
+                            rng = math.hypot(fx - x, fy - y)
                             if rng > self.obs_max_range:
                                 continue
-                            # Prefer the closest valid candidate
                             if rng < best_dist:
                                 best_dist = rng
-                                best = {'x': ox, 'y': oy, 'label': label}
+                                best = {'x': fx, 'y': fy, 'label': lbl}
                         except Exception:
                             continue
                     if best is not None:
@@ -1186,6 +1270,11 @@ class AutoOperateDynamic(Operate):
                     # Clear stored fruit target once visit completes
                     self._fruit_target_xy = None
                     self._fruit_target_label_base = None
+                    # Start a brief reverse phase before resuming navigation
+                    try:
+                        self._fruit_post_reverse_until = time.time() + float(self.fruit_post_hold_reverse_time)
+                    except Exception:
+                        self._fruit_post_reverse_until = 0.0
                     # Remove from queue front if matches
                     if self._fruit_visit_queue:
                         try:
@@ -1213,6 +1302,12 @@ class AutoOperateDynamic(Operate):
                                 self._pending_patrol_advance = bool(st.get('pending_patrol_advance', False))
                                 # Clear detour flag and resume same patrol target
                                 self._detour_active = False
+                                try:
+                                    if self.remaining_targets:
+                                        tx, ty = self.remaining_targets[0]
+                                        self._announce(f"Resuming patrol to ({tx:.2f},{ty:.2f})")
+                                except Exception:
+                                    pass
                                 self.replan(initial=False)
                                 self.pick_next_goal()
                             except Exception:
@@ -1256,11 +1351,15 @@ class AutoOperateDynamic(Operate):
             else:
                 # Spin finished — revert detection range
                 if self._obs_range_override_active:
-                    self.obs_max_range = 0.45
+                    self.obs_max_range = 0.48
                     self._obs_range_override_active = False
-                # Spin finished -> attempt fruit visits before advancing (if enabled)
+                # Spin finished -> start a short grace window to allow fruit queue to populate
                 self._arrival_spin_start = None
                 self._arrival_spin_pulse_start = None
+                try:
+                    self._post_spin_grace_until = time.time() + float(self.post_spin_grace)
+                except Exception:
+                    self._post_spin_grace_until = 0.0
                 if self.enable_fruit_visits:
                     # Prepare fruit queue (based on current discoveries & shopping list)
                     self._prepare_fruit_visit_queue()
@@ -1269,11 +1368,37 @@ class AutoOperateDynamic(Operate):
                         self._pending_patrol_advance = True
                         if self._start_next_fruit_target():
                             return
-                # If disabled or no fruits to visit, advance patrol immediately
+                # If disabled or no fruits yet, wait through grace period before advancing patrol
+                remaining = max(0.0, float(self._post_spin_grace_until or 0.0) - time.time())
+                self.notification = f'Post-spin grace ({remaining:.1f}s)'
+                self.command['motion'] = [0, 0]
+                return
+
+        # Handle grace period after arrival spin: wait briefly to allow fruit queue, then decide
+        try:
+            if self._post_spin_grace_until and time.time() < float(self._post_spin_grace_until):
+                remaining = float(self._post_spin_grace_until) - time.time()
+                self.notification = f'Post-spin grace ({remaining:.1f}s)'
+                self.command['motion'] = [0, 0]
+                # While waiting, keep trying to switch to fruit_nav if queue appears
+                if self.enable_fruit_visits:
+                    self._prepare_fruit_visit_queue()
+                    if self._fruit_visit_queue:
+                        self._post_spin_grace_until = 0.0
+                        self._mode = 'fruit_nav'
+                        self._pending_patrol_advance = True
+                        if self._start_next_fruit_target():
+                            return
+                return
+            elif self._post_spin_grace_until:
+                # Grace expired: clear and advance patrol if still no fruit
+                self._post_spin_grace_until = 0.0
                 if (not self.enable_fruit_visits) or (not self._fruit_visit_queue):
                     self._advance_target()
                     self.replan(initial=False)
                     self.pick_next_goal()
+        except Exception:
+            pass
 
         # Ensure we have a plan from current pose to remaining targets
         if (not self._planned_once and self.active) or (self.active and not self.waypoints):
@@ -1429,7 +1554,7 @@ class AutoOperateDynamic(Operate):
             fail_elapsed = now_fail - float(self._plan_fail_start or now_fail)
             # First threshold: covariance spin assist (kept at existing threshold)
             if fail_elapsed >= float(self._plan_fail_threshold):
-                if (self._cov_spin_until is None) and (not self._calib_mode) and (self._emergency_mode is None) and (self._mode != 'fruit_hold'):
+                if (self._cov_spin_until is None) and (not self._calib_mode) and (self._emergency_mode is None) and (self._mode != 'fruit_hold') and (self._arrival_spin_start is None):
                     self._cov_spin_dir = -self._cov_spin_dir  # alternate direction
                     self._cov_spin_until = now_fail + float(self.cov_spin_duration)
                     self._cov_spin_start = now_fail
@@ -1441,7 +1566,11 @@ class AutoOperateDynamic(Operate):
                     self._safety_margin_saved = self.safety_margin
                     self.safety_margin = 0.0
                     self._safety_probe_active = True
-                    self._safety_probe_until = now_fail + 3.0
+                    self._safety_probe_until = now_fail + float(getattr(self, 'safety_probe_duration', 3.0))
+                    # Cancel any ongoing covariance spin and suppress while probing
+                    if self._cov_spin_until is not None:
+                        self._cov_spin_until = None
+                        self._cov_spin_start = None
                     self.notification = 'Planning failed >20s: trying with reduced safety margin'
                     # Attempt an immediate replan with reduced margin
                     if self.active:
@@ -1465,6 +1594,10 @@ class AutoOperateDynamic(Operate):
                 keep_obs.append(d)
         self.discovered_obstacles = keep_obs
         self.notification = f'Patrol advancing to ({ntx:.2f},{nty:.2f})'
+        try:
+            self._announce(f"Going to waypoint {self.remaining_labels[0]} at ({ntx:.2f},{nty:.2f})")
+        except Exception:
+            pass
 
     def _is_close_to_current_target(self, goal_xy: List[float]) -> bool:
         if not self.remaining_targets:
@@ -1797,12 +1930,12 @@ if __name__ == "__main__":
     parser.add_argument("--list", type=str, default="")
     parser.add_argument("--grid_res", type=float, default=0.02)
     parser.add_argument("--robot_radius", type=float, default=0.11)
-    parser.add_argument("--safety_margin", type=float, default=0.095)
+    parser.add_argument("--safety_margin", type=float, default=0.097)
     # Merge threshold (main option). You can also use --merge_thresh alias below
     parser.add_argument("--merge_threshold", type=float, default=0.35,
                         help="Merge radius (meters) for clustering detections of the same fruit label")
     # only count/add obstacles when seen within this distance (meters)
-    parser.add_argument("--obs_max_range", type=float, default=0.45)
+    parser.add_argument("--obs_max_range", type=float, default=0.48)
     parser.add_argument("--play_data", action='store_true')
     parser.add_argument("--save_data", action='store_true')
     args, _ = parser.parse_known_args()
