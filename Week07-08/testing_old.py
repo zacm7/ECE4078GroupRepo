@@ -1571,6 +1571,12 @@ class AutoOperateDynamic(Operate):
                             self._visited_fruit_bases.add(self._base_label(lbl0))
                     except Exception:
                         pass
+                    # Announce collection of the fruit in the terminal
+                    try:
+                        if self.remaining_labels:
+                            self._announce(f"{self.remaining_labels[0]} collected")
+                    except Exception:
+                        pass
                     self._fruit_hold_start = None
                     # Clear stored fruit target once visit completes
                     self._fruit_target_xy = None
@@ -1638,7 +1644,7 @@ class AutoOperateDynamic(Operate):
             if elapsed_arrival < self.arrival_spin_duration:
                 # Increase detection range while spinning at waypoint
                 if not self._obs_range_override_active:
-                    self.obs_max_range = 0.65
+                    self.obs_max_range = 0.70
                     self._obs_range_override_active = True
                 # Initialize pulse timer
                 if self._arrival_spin_pulse_start is None:
@@ -1859,17 +1865,25 @@ class AutoOperateDynamic(Operate):
                 self._plan_fail_start = now_fail
                 self._plan_fail_target_snapshot = (list(self.remaining_targets[0]) if self.remaining_targets else None)
             else:
-                # If target changed since we started failing, reset the timer
+                # If target changed since we started failing, reset the timer — unless a safety probe is active.
+                # While probing reduced safety margins, we want the 20s window to continue accruing to allow
+                # the probe sequence to run without being interrupted by timer resets.
                 current_target_snapshot = (list(self.remaining_targets[0]) if self.remaining_targets else None)
                 if current_target_snapshot != getattr(self, '_plan_fail_target_snapshot', None):
-                    self._plan_fail_start = now_fail
+                    # Always update the snapshot to avoid repeated mismatches, but only reset the timer
+                    # if we are not actively probing safety margins.
                     self._plan_fail_target_snapshot = current_target_snapshot
+                    if not getattr(self, '_safety_probe_active', False):
+                        self._plan_fail_start = now_fail
 
             # If we've been failing to plan for long enough, either stabilize or skip to next target
             fail_elapsed = now_fail - float(self._plan_fail_start or now_fail)
             # First threshold: covariance spin assist (kept at existing threshold)
             if fail_elapsed >= float(self._plan_fail_threshold):
-                if (self._cov_spin_until is None) and (not self._calib_mode) and (self._emergency_mode is None) and (self._mode != 'fruit_hold') and (self._arrival_spin_start is None):
+                # If a safety probe is in progress, skip starting a covariance spin.
+                if getattr(self, '_safety_probe_active', False):
+                    pass
+                elif (self._cov_spin_until is None) and (not self._calib_mode) and (self._emergency_mode is None) and (self._mode != 'fruit_hold') and (self._arrival_spin_start is None):
                     self._cov_spin_dir = -self._cov_spin_dir  # alternate direction
                     self._cov_spin_until = now_fail + float(self.cov_spin_duration)
                     self._cov_spin_start = now_fail
@@ -1905,6 +1919,11 @@ class AutoOperateDynamic(Operate):
                             if self._cov_spin_until is not None:
                                 self._cov_spin_until = None
                                 self._cov_spin_start = None
+                            # Also set a short cooldown to prevent immediate re-trigger of cov spin
+                            try:
+                                self._cov_cooldown_until = time.time() + max(2.0, self.cov_spin_cooldown)
+                            except Exception:
+                                pass
                             self.notification = f"Planning failed >20s: trying safety margin {self.safety_margin:.3f} for 5 waypoints"
                             # Attempt an immediate replan with the first candidate margin
                             if self.active:
