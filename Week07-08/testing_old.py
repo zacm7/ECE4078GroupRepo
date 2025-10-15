@@ -1061,6 +1061,13 @@ class AutoOperateDynamic(Operate):
                     self._cov_spin_until = None
                     self._cov_spin_start = None
                     self._cov_cooldown_until = now_cov + self.cov_spin_cooldown
+                    # Spin finished — refresh plan now that pose is stabilized
+                    try:
+                        if (not self._calib_mode) and self.active and (self._emergency_mode is None) and (self._mode != 'fruit_hold'):
+                            self.replan(initial=False)
+                            self.pick_next_goal()
+                    except Exception:
+                        pass
                 # If in cooldown, skip covariance checks
                 if now_cov < self._cov_cooldown_until:
                     pass  # proceed with normal behavior
