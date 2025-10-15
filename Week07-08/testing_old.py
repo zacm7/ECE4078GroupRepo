@@ -1698,7 +1698,7 @@ class AutoOperateDynamic(Operate):
             if elapsed_arrival < self.arrival_spin_duration:
                 # Increase detection range while spinning at waypoint
                 if not self._obs_range_override_active:
-                    self.obs_max_range = 0.70
+                    self.obs_max_range = 0.75
                     self._obs_range_override_active = True
                 # Initialize pulse timer
                 if self._arrival_spin_pulse_start is None:
@@ -2428,7 +2428,7 @@ if __name__ == "__main__":
     parser.add_argument("--map", type=str, default="")
     parser.add_argument("--list", type=str, default="")
     parser.add_argument("--grid_res", type=float, default=0.02)
-    parser.add_argument("--robot_radius", type=float, default=0.12)
+    parser.add_argument("--robot_radius", type=float, default=0.14)
     parser.add_argument("--safety_margin", type=float, default=0.099)
     # Merge threshold (main option). You can also use --merge_thresh alias below
     parser.add_argument("--merge_threshold", type=float, default=0.35,
