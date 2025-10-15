@@ -331,6 +331,9 @@ class AutoOperateDynamic(Operate):
         self._safety_probe_until = 0.0
         # Duration to keep reduced safety margin active (seconds)
         self.safety_probe_duration = 9.0
+        # Waypoint-based probe control (new)
+        self._safety_probe_waypoints_left = 0
+        self._wp_counted = False
 
     def _save_fruit_locations(self):
         """Persist fruit obstacle locations as enumerated JSON mapping.
@@ -630,8 +633,31 @@ class AutoOperateDynamic(Operate):
             self.current_goal = None
             return
         self.current_goal = self.waypoints.pop(0)
+        # Reset probe waypoint count flag when starting a new goal
+        self._wp_counted = False
         self.reached_time = None
         self.notification = f'Navigating to: [{self.current_goal[0]:.2f}, {self.current_goal[1]:.2f}]'
+
+    # New: count waypoint arrivals during reduced safety probe
+    def _on_waypoint_reached(self):
+        try:
+            if self._safety_probe_active and not self._wp_counted:
+                self._wp_counted = True
+                self._safety_probe_waypoints_left = max(0, int(self._safety_probe_waypoints_left) - 1)
+                if self._safety_probe_waypoints_left <= 0:
+                    # Restore margin and replan
+                    restore_to = float(self._safety_margin_default)
+                    self.safety_margin = restore_to
+                    self._safety_probe_active = False
+                    self.notification = 'Probe complete (5 waypoints) — restoring safety margin'
+                    try:
+                        if self.active:
+                            self.replan(initial=False)
+                            self.pick_next_goal()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     # --- Terminal announcement helper ---
     def _announce(self, msg: str) -> None:
@@ -1057,8 +1083,8 @@ class AutoOperateDynamic(Operate):
 
         # If we had temporarily reduced the safety margin to probe a path, restore after window
         try:
-            if self._safety_probe_active and time.time() >= float(self._safety_probe_until):
-                # Restore safety margin and replan once
+            # Waypoint-based restore: if no waypoints left, ensure restored
+            if self._safety_probe_active and int(self._safety_probe_waypoints_left) <= 0:
                 restore_to = float(self._safety_margin_default)
                 self.safety_margin = restore_to
                 self._safety_probe_active = False
@@ -1587,7 +1613,7 @@ class AutoOperateDynamic(Operate):
                     near_fruit = None
                     for d in self.discovered_obstacles:
                         try:
-                            lbl = str(d.get('label',''))
+                            lbl = str(d.get('label', ''))
                             base = self._base_label(lbl)
                             if base not in self.shopping_list:
                                 continue
@@ -1613,10 +1639,20 @@ class AutoOperateDynamic(Operate):
                 if self._arrival_spin_start is None:
                     self._arrival_spin_start = time.time()
                     self.notification = f'Reached [{gx:.2f},{gy:.2f}] starting spin'
+                # Count this waypoint for probe progress
+                try:
+                    self._on_waypoint_reached()
+                except Exception:
+                    pass
                 # spin logic handled at top of loop; ensure immediate feedback
                 self.command['motion'] = [0, self.turn_cmd]
                 return
             else:
+                # Count this waypoint for probe progress before advancing
+                try:
+                    self._on_waypoint_reached()
+                except Exception:
+                    pass
                 self.pick_next_goal()
                 return
 
@@ -1718,14 +1754,15 @@ class AutoOperateDynamic(Operate):
             if fail_elapsed >= 20.0 and not self._safety_probe_active:
                 try:
                     self._safety_margin_saved = self.safety_margin
-                    self.safety_margin = 0.0
+                    self.safety_margin = 0.045
                     self._safety_probe_active = True
-                    self._safety_probe_until = now_fail + float(getattr(self, 'safety_probe_duration', 3.0))
+                    # Start waypoint-based probe (5 waypoints)
+                    self._safety_probe_waypoints_left = 5
                     # Cancel any ongoing covariance spin and suppress while probing
                     if self._cov_spin_until is not None:
                         self._cov_spin_until = None
                         self._cov_spin_start = None
-                    self.notification = 'Planning failed >20s: trying with reduced safety margin'
+                    self.notification = 'Planning failed >20s: reduced safety margin for 5 waypoints'
                     # Attempt an immediate replan with reduced margin
                     if self.active:
                         self.replan(initial=False)
