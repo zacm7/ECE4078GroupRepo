@@ -266,10 +266,14 @@ class AutoOperateDynamic(Operate):
         # Fruit visit parameters
         self.fruit_visit_radius = 0.08  # meters (15cm; approach within this distance counts as visited)
         self.fruit_hold_duration = 5.0  # seconds to hold at fruit
+        # Timeout for reaching/holding at an active fruit target (seconds)
+        self.fruit_target_timeout = 7 * 60.0
         # Fruit visit state
         self._fruit_visit_queue = []
         self._fruit_queue_last_sig = None  # track last queue signature to announce changes
         self._fruit_hold_start = None
+        # Deadline by which we must reach and begin holding at the active fruit; 0.0 means inactive
+        self._fruit_target_deadline = 0.0
         self._visited_fruits_cycle = set()  # enumerated labels visited in current patrol leg
     # Persistent record of visited fruit base labels (e.g., 'potato') for the entire run
         self._visited_fruit_bases = set()
@@ -477,6 +481,11 @@ class AutoOperateDynamic(Operate):
         self.pick_next_goal()
         self._mode = 'fruit_nav'
         self.notification = f"Heading to fruit: {self.remaining_labels[0]}"
+        # Start deadline timer for reaching this fruit
+        try:
+            self._fruit_target_deadline = time.time() + float(self.fruit_target_timeout)
+        except Exception:
+            self._fruit_target_deadline = 0.0
         try:
             self._announce(f"Visiting fruit: {self.remaining_labels[0]} at ({fx:.2f},{fy:.2f})")
         except Exception:
@@ -523,6 +532,11 @@ class AutoOperateDynamic(Operate):
         self.pick_next_goal()
         self._mode = 'fruit_nav'
         self._detour_active = True
+        # Start deadline timer for reaching this fruit (detour)
+        try:
+            self._fruit_target_deadline = time.time() + float(self.fruit_target_timeout)
+        except Exception:
+            self._fruit_target_deadline = 0.0
         # Cancel any pending arrival spin from patrol so detour doesn't spin at fruit
         self._arrival_spin_start = None
         self._arrival_spin_pulse_start = None
@@ -1231,6 +1245,55 @@ class AutoOperateDynamic(Operate):
         # If we are navigating specifically to a fruit (opportunistic detours or queued visits)
         if (self.enable_fruit_visits or self.enable_opportunistic_detours) and self._mode == 'fruit_nav':
             try:
+                # Enforce per-fruit target deadline: if expired before reaching hold, abandon this fruit
+                try:
+                    if float(self._fruit_target_deadline or 0.0) > 0.0 and time.time() >= float(self._fruit_target_deadline):
+                        # Timeout: skip this fruit and move on
+                        lbl_timeout = None
+                        try:
+                            if self.remaining_labels:
+                                lbl_timeout = self.remaining_labels[0]
+                        except Exception:
+                            pass
+                        self._announce(f"Fruit target timed out: {lbl_timeout or 'fruit'} — skipping")
+                        # Remove from front of queue if it matches
+                        try:
+                            if self._fruit_visit_queue:
+                                if lbl_timeout and str(self._fruit_visit_queue[0].get('label','')).lower() == str(lbl_timeout).lower():
+                                    self._fruit_visit_queue.pop(0)
+                        except Exception:
+                            pass
+                        # If we were detouring, restore patrol; otherwise, try next fruit
+                        if self._detour_active and self._saved_patrol_state is not None:
+                            try:
+                                st = self._saved_patrol_state
+                                self.remaining_targets = [list(t) for t in (st.get('remaining_targets') or [])] or self.remaining_targets
+                                self.remaining_labels = list(st.get('remaining_labels') or self.remaining_labels)
+                                self.waypoints = []
+                                self.current_goal = None
+                                self._mode = 'patrol'
+                                self._pending_patrol_advance = bool(st.get('pending_patrol_advance', False))
+                                self._detour_active = False
+                                self.replan(initial=False)
+                                self.pick_next_goal()
+                            except Exception:
+                                self._mode = 'patrol'
+                            finally:
+                                self._saved_patrol_state = None
+                        else:
+                            # Try next fruit in the queue or resume patrol if none
+                            if self._start_next_fruit_target():
+                                return
+                            else:
+                                self._mode = 'patrol'
+                                if self._pending_patrol_advance:
+                                    self._pending_patrol_advance = False
+                                    self._advance_target()
+                                    self.replan(initial=False)
+                                    self.pick_next_goal()
+                                return
+                except Exception:
+                    pass
                 # Use the actual fruit target position (not intermediate waypoints)
                 if self._fruit_target_xy is not None:
                     fx, fy = self._fruit_target_xy
@@ -1246,6 +1309,8 @@ class AutoOperateDynamic(Operate):
                         self.notification = f"At fruit {self.remaining_labels[0]} holding"
                         self.command['motion'] = [0, 0]
                         self._mode = 'fruit_hold'
+                        # Clear the deadline now that we've reached and started holding at the fruit
+                        self._fruit_target_deadline = 0.0
                         return
             except Exception:
                 pass

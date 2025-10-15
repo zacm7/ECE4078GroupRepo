@@ -1,5 +1,5 @@
-garlic
 lemon
-potato
+garlic
 pear
-tomato
+potato
+orange
