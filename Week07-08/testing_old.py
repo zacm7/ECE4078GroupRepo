@@ -280,7 +280,7 @@ class AutoOperateDynamic(Operate):
         # detour to it, hold, then resume original patrol.
         self.enable_opportunistic_detours = True
         # Fruit visit parameters
-        self.fruit_visit_radius = 0.09  # meters (15cm; approach within this distance counts as visited)
+        self.fruit_visit_radius = 0.08  # meters (15cm; approach within this distance counts as visited)
         self.fruit_hold_duration = 5.0  # seconds to hold at fruit
         # Timeout for reaching/holding at an active fruit target (seconds)
         # 6.7 minutes = 402 seconds
@@ -301,9 +301,6 @@ class AutoOperateDynamic(Operate):
         self._observe_align_start = None
         self._observe_align_pulse_start = None
         self._observe_align_spin_dir = 1
-    # Add a hard cap for observe-only alignment as well (same as fruit_align_max_time)
-        self.observe_align_max_time = float(getattr(self, 'fruit_align_max_time', 45.0))
-        self._observe_align_enter_time = None
         self._observe_label_base = None
         self._observe_label_display = None
         self._observe_cooldown_until = 0.0
@@ -1125,30 +1122,6 @@ class AutoOperateDynamic(Operate):
         if self.enable_observe_align and self._mode == 'observe_align':
             try:
                 now_obs = time.time()
-                # Initialize enter-time once per observe session
-                if getattr(self, '_observe_align_enter_time', None) is None:
-                    self._observe_align_enter_time = now_obs
-                else:
-                    # Enforce max cap for observe align
-                    try:
-                        if (now_obs - float(self._observe_align_enter_time or now_obs)) >= float(self.observe_align_max_time):
-                            # Timeout: end observe and resume patrol
-                            disp = self._observe_label_display or 'fruit'
-                            try:
-                                self._announce(f"Observation timed out (45s): {disp}")
-                            except Exception:
-                                pass
-                            self._observe_align_pulse_start = None
-                            self._observe_align_start = None
-                            self._observe_align_enter_time = None
-                            self._observe_label_base = None
-                            self._observe_label_display = None
-                            self._mode = 'patrol'
-                            self._observe_cooldown_until = now_obs + 8.0
-                            self.notification = "Observation timed out — resuming patrol"
-                            return
-                    except Exception:
-                        pass
                 base = self._observe_label_base
                 centered_recent = False
                 if base is not None:
@@ -1186,7 +1159,6 @@ class AutoOperateDynamic(Operate):
                     # Observation complete — resume patrol path (no replan required here)
                     self._observe_align_pulse_start = None
                     self._observe_align_start = None
-                    self._observe_align_enter_time = None
                     self._observe_label_base = None
                     self._observe_label_display = None
                     self._mode = 'patrol'
@@ -1953,10 +1925,7 @@ class AutoOperateDynamic(Operate):
         x, y, _ = self.get_pose()
         robot_xy = [x, y]
         obstacles_xy: List[List[float]] = []
-        # ArUco markers: apply a small fixed keep-out radius of 0.04m
-        for (ox, oy) in self._get_current_aruco_obstacles():
-            obstacles_xy.append([float(ox), float(oy), 0.04])
-        # Fruit and other discovered obstacles: use default planner clearance (no explicit radius)
+        obstacles_xy.extend([[ox, oy] for (ox, oy) in self._get_current_aruco_obstacles()])
         obstacles_xy.extend([[float(d['x']), float(d['y'])] for d in self.discovered_obstacles])
         inner = max(0.0, float(self.arena_half) - float(self.wall_clearance))
         if inner > 0.0:
@@ -1976,12 +1945,7 @@ class AutoOperateDynamic(Operate):
                                            safety_margin=self.safety_margin)
             # Post-process: nudge waypoints away from obstacles if too close
             try:
-                # For nudging and clamping, use just positions
-                ob_xy_positions: List[List[float]] = []
-                for ob in obstacles_xy:
-                    if isinstance(ob, (list, tuple)) and len(ob) >= 2:
-                        ob_xy_positions.append([float(ob[0]), float(ob[1])])
-                new_waypoints = self._nudge_waypoints_from_obstacles(new_waypoints, ob_xy_positions, min_clearance=0.10)
+                new_waypoints = self._nudge_waypoints_from_obstacles(new_waypoints, obstacles_xy, min_clearance=0.10)
                 # Clamp within arena inner boundary if configured (tiny inset to avoid exact wall)
                 inner = max(0.0, float(self.arena_half) - float(self.wall_clearance))
                 if inner > 0.0 and new_waypoints:
@@ -2571,8 +2535,8 @@ if __name__ == "__main__":
     parser.add_argument("--map", type=str, default="")
     parser.add_argument("--list", type=str, default="")
     parser.add_argument("--grid_res", type=float, default=0.02)
-    parser.add_argument("--robot_radius", type=float, default=0.14)
-    parser.add_argument("--safety_margin", type=float, default=0.099)
+    parser.add_argument("--robot_radius", type=float, default=0.13)
+    parser.add_argument("--safety_margin", type=float, default=0.10)
     # Merge threshold (main option). You can also use --merge_thresh alias below
     parser.add_argument("--merge_threshold", type=float, default=0.35,
                         help="Merge radius (meters) for clustering detections of the same fruit label")
