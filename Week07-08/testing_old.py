@@ -88,13 +88,9 @@ class AutoOperateDynamic(Operate):
             # Only prompt when running in an interactive terminal
             if getattr(sys, 'stdin', None) is not None and sys.stdin.isatty():
                 try:
-                    print("Patrol waypoints (1-4):", flush=True)
-                    for i, (px, py) in enumerate(pts, start=1):
-                        try:
-                            print(f" {i}: ({float(px):.2f}, {float(py):.2f})", flush=True)
-                        except Exception:
-                            print(f" {i}: ({px}, {py})", flush=True)
-                    user_in = input("Enter patrol order (e.g., 2341) or press ENTER for default: ").strip()
+                    user_in = input(
+                        "Enter patrol order (1-4, e.g., 2341). Press ENTER for default (1234): "
+                    ).strip()
                 except Exception:
                     user_in = ""
                 # Normalize to just the digits 1-4
@@ -104,19 +100,8 @@ class AutoOperateDynamic(Operate):
                     if all(0 <= idx < 4 for idx in order):
                         try:
                             pts = [pts[idx] for idx in order]
-                            print(f"Using patrol order {''.join(digits)}: "
-                                  f"[{', '.join([f'({float(x):.2f}, {float(y):.2f})' for x, y in pts])}]",
-                                  flush=True)
                         except Exception:
-                            # Fallback print without formatting
-                            print(f"Using patrol order {''.join(digits)}: {pts}", flush=True)
-                else:
-                    # Keep default order; optionally echo current order for clarity
-                    try:
-                        curr = ''.join(str(i) for i in range(1, 5))
-                        print(f"Keeping default patrol order {curr}", flush=True)
-                    except Exception:
-                        pass
+                            pass
         except Exception:
             # Never let input issues break initialization
             pass
