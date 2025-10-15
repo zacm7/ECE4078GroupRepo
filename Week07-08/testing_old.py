@@ -82,28 +82,16 @@ class AutoOperateDynamic(Operate):
             pts.append(default_patrol[len(pts) % len(default_patrol)])
         if len(pts) > 4:
             pts = pts[:4]
-        # Optional: interactive reorder via terminal (digits 1-4 like 2341)
+        # Optional: reorder via CLI argument --quadrants (digits 1-4 like 2341)
         try:
-            import sys
-            # Only prompt when running in an interactive terminal
-            if getattr(sys, 'stdin', None) is not None and sys.stdin.isatty():
-                try:
-                    user_in = input(
-                        "Enter patrol order (1-4, e.g., 2341). Press ENTER for default (1234): "
-                    ).strip()
-                except Exception:
-                    user_in = ""
-                # Normalize to just the digits 1-4
-                digits = [ch for ch in user_in if ch in '1234']
-                if len(digits) == 4 and len(set(digits)) == 4:
-                    order = [int(d) - 1 for d in digits]
-                    if all(0 <= idx < 4 for idx in order):
-                        try:
-                            pts = [pts[idx] for idx in order]
-                        except Exception:
-                            pass
+            q = str(getattr(args, 'quadrants', '') or '')
+            digits = [ch for ch in q if ch in '1234']
+            if len(digits) == 4 and len(set(digits)) == 4:
+                order = [int(d) - 1 for d in digits]
+                if all(0 <= idx < 4 for idx in order):
+                    pts = [pts[idx] for idx in order]
         except Exception:
-            # Never let input issues break initialization
+            # Ignore invalid quadrants input
             pass
         self.patrol_points: List[Tuple[float, float]] = pts
         self.patrol_index: int = 0
@@ -1872,6 +1860,50 @@ class AutoOperateDynamic(Operate):
                 self.command['motion'] = [0, 0]
 
     # ============= Planning =============
+    def _nudge_waypoints_from_obstacles(self,
+                                        waypoints: List[List[float]],
+                                        obstacles_xy: List[List[float]],
+                                        min_clearance: float = 0.10) -> List[List[float]]:
+        """Return a copy of waypoints nudged away from the nearest obstacle
+        so each is at least min_clearance away. Small, single-step adjustment.
+        """
+        try:
+            if not waypoints or not obstacles_xy:
+                return waypoints
+            adjusted: List[List[float]] = []
+            for wp in waypoints:
+                try:
+                    wx, wy = float(wp[0]), float(wp[1])
+                except Exception:
+                    adjusted.append(wp)
+                    continue
+                nearest_d = 1e9
+                n_ox, n_oy = 0.0, 0.0
+                for ob in obstacles_xy:
+                    try:
+                        ox, oy = float(ob[0]), float(ob[1])
+                    except Exception:
+                        continue
+                    dx = wx - ox
+                    dy = wy - oy
+                    d = math.hypot(dx, dy)
+                    if d < nearest_d:
+                        nearest_d = d
+                        n_ox, n_oy = ox, oy
+                if nearest_d < min_clearance and nearest_d > 1e-6:
+                    # push outward from the nearest obstacle by the shortfall + small buffer
+                    dx = wx - n_ox
+                    dy = wy - n_oy
+                    nx = dx / nearest_d
+                    ny = dy / nearest_d
+                    push = (min_clearance + 0.02) - nearest_d
+                    wx += nx * max(0.0, push)
+                    wy += ny * max(0.0, push)
+                adjusted.append([wx, wy])
+            return adjusted
+        except Exception:
+            return waypoints
+
     def replan(self, initial: bool = False):
         """Plan waypoints from current pose to patrol target, avoiding dynamic obstacles."""
         if self._calib_mode:
@@ -1903,6 +1935,25 @@ class AutoOperateDynamic(Operate):
                                            grid_res=self.grid_res,
                                            robot_radius=self.robot_radius,
                                            safety_margin=self.safety_margin)
+            # Post-process: nudge waypoints away from obstacles if too close
+            try:
+                new_waypoints = self._nudge_waypoints_from_obstacles(new_waypoints, obstacles_xy, min_clearance=0.10)
+                # Clamp within arena inner boundary if configured (tiny inset to avoid exact wall)
+                inner = max(0.0, float(self.arena_half) - float(self.wall_clearance))
+                if inner > 0.0 and new_waypoints:
+                    clamped: List[List[float]] = []
+                    inset = 0.01
+                    for w in new_waypoints:
+                        try:
+                            wx, wy = float(w[0]), float(w[1])
+                            wx = max(-inner + inset, min(inner - inset, wx))
+                            wy = max(-inner + inset, min(inner - inset, wy))
+                            clamped.append([wx, wy])
+                        except Exception:
+                            clamped.append(w)
+                    new_waypoints = clamped
+            except Exception:
+                pass
             self.waypoints = new_waypoints
             self.current_goal = None
             msg_prefix = 'Planned' if initial else 'Replanned'
@@ -2437,12 +2488,15 @@ if __name__ == "__main__":
     parser.add_argument("--obs_max_range", type=float, default=0.48)
     parser.add_argument("--play_data", action='store_true')
     parser.add_argument("--save_data", action='store_true')
+    parser.add_argument("--quadrants", type=str, default="1234",
+                        help="Reorder default patrol points using a 4-digit code with digits 1-4 (e.g., 2341)")
     args, _ = parser.parse_known_args()
 
     # Provide globals to operate.py expectations (previously Week05-06, now local)
     op_args = SimpleNamespace(
         ip=args.ip, port=args.port, calib_dir=args.calib_dir,
         yolo_model=args.yolo_model, play_data=args.play_data, save_data=args.save_data,
+        quadrants=args.quadrants,
     )
     operate_mod.args = op_args
 
