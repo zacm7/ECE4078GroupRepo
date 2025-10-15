@@ -264,10 +264,17 @@ class AutoOperateDynamic(Operate):
         # detour to it, hold, then resume original patrol.
         self.enable_opportunistic_detours = True
         # Fruit visit parameters
-        self.fruit_visit_radius = 0.08  # meters (15cm; approach within this distance counts as visited)
+        self.fruit_visit_radius = 0.084  # meters (15cm; approach within this distance counts as visited)
         self.fruit_hold_duration = 5.0  # seconds to hold at fruit
         # Timeout for reaching/holding at an active fruit target (seconds)
         self.fruit_target_timeout = 7 * 60.0
+    # Alignment phase: before driving to a fruit, center it and look for a short dwell
+        self.fruit_align_duration = 5.0  # seconds to keep fruit centered before starting nav
+        self._fruit_align_start = None
+        self._fruit_align_pulse_start = None
+        self._fruit_align_spin_dir = 1
+        # Track last-centered time per base label (updated by perception)
+        self._last_centered_label_time: Dict[str, float] = {}
         # Fruit visit state
         self._fruit_visit_queue = []
         self._fruit_queue_last_sig = None  # track last queue signature to announce changes
@@ -474,13 +481,11 @@ class AutoOperateDynamic(Operate):
         self._fruit_target_last_update = time.time()
         self.waypoints = []
         self.current_goal = None
-        try:
-            self.replan(initial=False)
-        except Exception:
-            pass
-        self.pick_next_goal()
-        self._mode = 'fruit_nav'
-        self.notification = f"Heading to fruit: {self.remaining_labels[0]}"
+        # Enter alignment phase first: center the fruit and dwell before navigating
+        self._fruit_align_start = None
+        self._fruit_align_pulse_start = None
+        self._mode = 'fruit_align'
+        self.notification = f"Aligning to fruit: {self.remaining_labels[0]} (center + {self.fruit_align_duration:.0f}s)"
         # Start deadline timer for reaching this fruit
         try:
             self._fruit_target_deadline = time.time() + float(self.fruit_target_timeout)
@@ -525,12 +530,10 @@ class AutoOperateDynamic(Operate):
         self._fruit_target_last_update = time.time()
         self.waypoints = []
         self.current_goal = None
-        try:
-            self.replan(initial=False)
-        except Exception:
-            pass
-        self.pick_next_goal()
-        self._mode = 'fruit_nav'
+        # Enter alignment phase first: center the fruit and dwell before navigating
+        self._fruit_align_start = None
+        self._fruit_align_pulse_start = None
+        self._mode = 'fruit_align'
         self._detour_active = True
         # Start deadline timer for reaching this fruit (detour)
         try:
@@ -956,8 +959,9 @@ class AutoOperateDynamic(Operate):
         # --- High covariance stabilize spin (preempts other actions) ---
         try:
             now_cov = time.time()
-            # Do not start or run covariance spin during fruit hold, any emergency phase, arrival (waypoint) spin, or safety-probe window
-            if self._mode != 'fruit_hold' and getattr(self, '_emergency_mode', None) is None and self._arrival_spin_start is None and not self._safety_probe_active:
+            # Do not start or run covariance spin during fruit hold, fruit alignment, any emergency phase,
+            # arrival (waypoint) spin, or safety-probe window
+            if (self._mode not in ('fruit_hold', 'fruit_align')) and getattr(self, '_emergency_mode', None) is None and self._arrival_spin_start is None and not self._safety_probe_active:
                 # If currently spinning due to high covariance, keep spinning until timeout
                 if self._cov_spin_until is not None and now_cov < self._cov_spin_until:
                     # Pulsed behavior: rotate for cov_pulse_spin_time then stop for cov_pulse_stop_time
@@ -1154,7 +1158,7 @@ class AutoOperateDynamic(Operate):
             self._log_pose(now)
             self._last_pose_log = now
         self._flush_log(force=False)
-        if tag_count < 2 and self._mode not in ('fruit_nav', 'fruit_hold'):
+        if tag_count < 2 and self._mode not in ('fruit_nav', 'fruit_hold', 'fruit_align'):
             if not self._planned_once:
                 # Kick off a best-effort initial plan so we can start moving even with few tags
                 if self.active:
@@ -1241,6 +1245,57 @@ class AutoOperateDynamic(Operate):
             except Exception:
                 pass
 
+        # Fruit alignment state: pulse-spin to center the target fruit, then dwell before navigation
+        if (self.enable_fruit_visits or self.enable_opportunistic_detours) and self._mode == 'fruit_align':
+            try:
+                now_align = time.time()
+                base = self._fruit_target_label_base
+                centered_recent = False
+                if base is not None:
+                    try:
+                        t_last = float(self._last_centered_label_time.get(base, 0.0))
+                        centered_recent = (now_align - t_last) <= 0.5
+                    except Exception:
+                        centered_recent = False
+
+                if not centered_recent:
+                    # Not centered yet — keep pulse-spinning in place
+                    self._fruit_align_start = None  # reset dwell timer
+                    if self._fruit_align_pulse_start is None:
+                        self._fruit_align_pulse_start = now_align
+                    a_period = float(self.arrival_pulse_spin_time + self.arrival_pulse_stop_time)
+                    a_phase = (now_align - self._fruit_align_pulse_start) % a_period
+                    if a_phase < self.arrival_pulse_spin_time:
+                        self.command['motion'] = [0, self._fruit_align_spin_dir * self.turn_cmd]
+                    else:
+                        self.command['motion'] = [0, 0]
+                    self.notification = f"Centering {self.remaining_labels[0]}…"
+                    return
+
+                # Fruit centered: dwell (look at fruit) for fruit_align_duration
+                if self._fruit_align_start is None:
+                    self._fruit_align_start = now_align
+                    # flip spin direction next time we need to re-center
+                    self._fruit_align_spin_dir *= -1
+                self.command['motion'] = [0, 0]
+                remaining = max(0.0, float(self.fruit_align_duration) - (now_align - float(self._fruit_align_start or now_align)))
+                self.notification = f"Holding fruit centered {remaining:.1f}s"
+                if (now_align - float(self._fruit_align_start or now_align)) >= float(self.fruit_align_duration):
+                    # Alignment complete — plan and start navigating to fruit
+                    try:
+                        self.replan(initial=False)
+                    except Exception:
+                        pass
+                    self.pick_next_goal()
+                    self._mode = 'fruit_nav'
+                    self._fruit_align_pulse_start = None
+                    self.notification = f"Heading to fruit: {self.remaining_labels[0]}"
+                    return
+                # Keep holding still during dwell; do not fall through to other controllers this cycle
+                return
+            except Exception:
+                pass
+
         # Fruit visit state handling (executed before arrival spin completion when active)
         # If we are navigating specifically to a fruit (opportunistic detours or queued visits)
         if (self.enable_fruit_visits or self.enable_opportunistic_detours) and self._mode == 'fruit_nav':
@@ -1303,7 +1358,7 @@ class AutoOperateDynamic(Operate):
                     fx, fy = self.current_goal
                 rx, ry, _ = self.get_pose()
                 if math.hypot(fx - rx, fy - ry) <= self.fruit_visit_radius:
-                    # Reached fruit: enter hold
+                    # Reached fruit: enter hold (we still perform a timed hold on arrival)
                     if self._fruit_hold_start is None:
                         self._fruit_hold_start = time.time()
                         self.notification = f"At fruit {self.remaining_labels[0]} holding"
@@ -1753,6 +1808,12 @@ class AutoOperateDynamic(Operate):
                     if not label.startswith('aruco'):
                         center_found = True
                         self.notification = "Fruit is in center"
+                        # Record last-centered time for this fruit base label (for alignment phase)
+                        try:
+                            base = self._base_label(label)
+                            self._last_centered_label_time[base] = now
+                        except Exception:
+                            pass
             except Exception:
                 # If anything goes wrong computing the check, fall back to allowing the update
                 pass
