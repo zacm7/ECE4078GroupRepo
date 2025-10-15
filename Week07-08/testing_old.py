@@ -290,8 +290,8 @@ class AutoOperateDynamic(Operate):
         self._fruit_align_start = None
         self._fruit_align_pulse_start = None
         self._fruit_align_spin_dir = 1
-        # Max time to spend trying to center a target fruit before skipping (seconds)
-        self.fruit_align_max_time = 45.0
+    # Max time to spend trying to center a target fruit before skipping (seconds)
+        self.fruit_align_max_time = 20.0
         self._fruit_align_enter_time = None
         # Track last-centered time per base label (updated by perception)
         self._last_centered_label_time = {}
@@ -313,6 +313,10 @@ class AutoOperateDynamic(Operate):
         self._visited_fruits_cycle = set()  # enumerated labels visited in current patrol leg
     # Persistent record of visited fruit base labels (e.g., 'potato') for the entire run
         self._visited_fruit_bases = set()
+        # Fruits temporarily skipped (by base label) after alignment/timeout; do not re-pick until deadline
+        self._fruit_skip_until: dict[str, float] = {}
+        # Cooldown duration before a skipped fruit can be reconsidered (defaults to align max time)
+        self.fruit_skip_cooldown = float(self.fruit_align_max_time)
         self._pending_patrol_advance = False  # set when we've deferred advancing to next patrol point until fruit visits done
         self._mode = 'patrol'  # 'patrol' | 'arrival_spin' | 'fruit_nav' | 'fruit_hold'
     # Track the actual fruit target position for proximity checks (avoid using intermediate waypoints)
@@ -463,6 +467,12 @@ class AutoOperateDynamic(Operate):
                     if lbl in self._visited_fruits_cycle:
                         continue
                     base = self._base_label(lbl)
+                    # Respect temporary skip window
+                    try:
+                        if base in self._fruit_skip_until and time.time() < float(self._fruit_skip_until.get(base, 0.0)):
+                            continue
+                    except Exception:
+                        pass
                     if base not in self.shopping_list:
                         continue
                     # Skip if visited already in this run
@@ -1407,6 +1417,12 @@ class AutoOperateDynamic(Operate):
                             if lbl.startswith('aruco'):
                                 continue
                             base = self._base_label(lbl)
+                            # Skip fruits currently under skip cooldown
+                            try:
+                                if base in self._fruit_skip_until and time.time() < float(self._fruit_skip_until.get(base, 0.0)):
+                                    continue
+                            except Exception:
+                                pass
                             if base not in self.shopping_list:
                                 continue
                             if base in getattr(self, '_visited_fruit_bases', set()):
@@ -1440,7 +1456,14 @@ class AutoOperateDynamic(Operate):
                                 lbl_timeout = self.remaining_labels[0]
                         except Exception:
                             pass
-                        self._announce(f"Centering timed out (45s): skipping {lbl_timeout or 'fruit'}")
+                        self._announce(f"Centering timed out ({self.fruit_align_max_time:.0f}s): skipping {lbl_timeout or 'fruit'}")
+                        # Add to skip list by base label so we don't immediately reattempt
+                        try:
+                            base = self._base_label(str(lbl_timeout or ''))
+                            if base:
+                                self._fruit_skip_until[base] = now_align + float(self.fruit_skip_cooldown)
+                        except Exception:
+                            pass
                         # Remove from front of queue if it matches
                         try:
                             if self._fruit_visit_queue and lbl_timeout:
@@ -1474,8 +1497,11 @@ class AutoOperateDynamic(Operate):
                                 return
                             else:
                                 self._mode = 'patrol'
-                                # If patrol was pending advance, keep that behavior; otherwise just replan
+                                # If patrol was pending advance, advance now; otherwise just replan current target
                                 try:
+                                    if self._pending_patrol_advance and not self._detour_active:
+                                        self._pending_patrol_advance = False
+                                        self._advance_target()
                                     self.replan(initial=False)
                                     self.pick_next_goal()
                                 except Exception:
@@ -1546,6 +1572,13 @@ class AutoOperateDynamic(Operate):
                         except Exception:
                             pass
                         self._announce(f"Fruit target timed out: {lbl_timeout or 'fruit'} — skipping")
+                        # Add to skip list by base label
+                        try:
+                            base = self._base_label(str(lbl_timeout or ''))
+                            if base:
+                                self._fruit_skip_until[base] = time.time() + float(self.fruit_skip_cooldown)
+                        except Exception:
+                            pass
                         # Remove from front of queue if it matches
                         try:
                             if self._fruit_visit_queue:
