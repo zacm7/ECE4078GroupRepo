@@ -264,10 +264,10 @@ class AutoOperateDynamic(Operate):
         # detour to it, hold, then resume original patrol.
         self.enable_opportunistic_detours = True
         # Fruit visit parameters
-        self.fruit_visit_radius = 0.08  # meters (15cm; approach within this distance counts as visited)
+        self.fruit_visit_radius = 0.085  # meters (15cm; approach within this distance counts as visited)
         self.fruit_hold_duration = 5.0  # seconds to hold at fruit
-    # Per-fruit timeout (in seconds) – 6.7 minutes
-        self.fruit_target_timeout = 402.0
+    # Per-fruit timeout (in seconds) – 5.5 minutes
+        self.fruit_target_timeout = 330.0
         # Deadline timestamp for current fruit target (epoch seconds); 0 means inactive
         self._fruit_target_deadline = 0.0
         # Fruit visit state
@@ -308,7 +308,7 @@ class AutoOperateDynamic(Operate):
 
         # Periodic replan settings
         # In addition to event-driven replans, refresh the plan at a fixed cadence
-        self._periodic_replan_interval = 30  # seconds
+        self._periodic_replan_interval = 30  # second
         self._last_periodic_replan = time.time()
     # Plan-failure watchdog: if planning fails continuously for this long, trigger a cov spin
         self._plan_fail_start = None  # type: ignore[assignment]

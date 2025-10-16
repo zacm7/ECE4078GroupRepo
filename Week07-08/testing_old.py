@@ -280,18 +280,18 @@ class AutoOperateDynamic(Operate):
         # detour to it, hold, then resume original patrol.
         self.enable_opportunistic_detours = True
         # Fruit visit parameters
-        self.fruit_visit_radius = 0.08  # meters (15cm; approach within this distance counts as visited)
+        self.fruit_visit_radius = 0.085  # meters (15cm; approach within this distance counts as visited)
         self.fruit_hold_duration = 5.0  # seconds to hold at fruit
         # Timeout for reaching/holding at an active fruit target (seconds)
         # 6.7 minutes = 402 seconds
-        self.fruit_target_timeout = 402.0
+        self.fruit_target_timeout = 350.0
         # Alignment phase: before driving to a fruit, center it and look for a short dwell
-        self.fruit_align_duration = 8.0  # seconds to keep fruit centered before starting nav
+        self.fruit_align_duration = 5.0  # seconds to keep fruit centered before starting nav
         self._fruit_align_start = None
         self._fruit_align_pulse_start = None
         self._fruit_align_spin_dir = 1
     # Max time to spend trying to center a target fruit before skipping (seconds)
-        self.fruit_align_max_time = 20.0
+        self.fruit_align_max_time = 25.0
         self._fruit_align_enter_time = None
         # Track last-centered time per base label (updated by perception)
         self._last_centered_label_time = {}
@@ -301,6 +301,9 @@ class AutoOperateDynamic(Operate):
         self._observe_align_start = None
         self._observe_align_pulse_start = None
         self._observe_align_spin_dir = 1
+    # Cap observe-only centering attempts as well (same limit as target fruit alignment)
+        self.observe_align_max_time = float(self.fruit_align_max_time)
+        self._observe_align_enter_time = None
         self._observe_label_base = None
         self._observe_label_display = None
         self._observe_cooldown_until = 0.0
@@ -1132,6 +1135,35 @@ class AutoOperateDynamic(Operate):
         if self.enable_observe_align and self._mode == 'observe_align':
             try:
                 now_obs = time.time()
+                # Initialize enter-time once per observe session and enforce max cap
+                if getattr(self, '_observe_align_enter_time', None) is None:
+                    self._observe_align_enter_time = now_obs
+                else:
+                    try:
+                        if (now_obs - float(self._observe_align_enter_time or now_obs)) >= float(self.observe_align_max_time):
+                            # Timeout: end observe and resume patrol; add to skip cooldown
+                            disp = self._observe_label_display or 'fruit'
+                            try:
+                                self._announce(f"Observation timed out ({self.observe_align_max_time:.0f}s): {disp}")
+                            except Exception:
+                                pass
+                            try:
+                                if self._observe_label_base:
+                                    base = self._observe_label_base
+                                    self._fruit_skip_until[base] = now_obs + float(self.fruit_skip_cooldown)
+                            except Exception:
+                                pass
+                            self._observe_align_pulse_start = None
+                            self._observe_align_start = None
+                            self._observe_align_enter_time = None
+                            self._observe_label_base = None
+                            self._observe_label_display = None
+                            self._mode = 'patrol'
+                            self._observe_cooldown_until = now_obs + 8.0
+                            self.notification = "Observation timed out — resuming patrol"
+                            return
+                    except Exception:
+                        pass
                 base = self._observe_label_base
                 centered_recent = False
                 if base is not None:
@@ -1169,6 +1201,7 @@ class AutoOperateDynamic(Operate):
                     # Observation complete — resume patrol path (no replan required here)
                     self._observe_align_pulse_start = None
                     self._observe_align_start = None
+                    self._observe_align_enter_time = None
                     self._observe_label_base = None
                     self._observe_label_display = None
                     self._mode = 'patrol'
@@ -2538,10 +2571,17 @@ class AutoOperateDynamic(Operate):
             try:
                 if self.enable_observe_align and self._mode == 'patrol' and not self._calib_mode and getattr(self, '_emergency_mode', None) is None:
                     if time.time() >= float(self._observe_cooldown_until or 0.0):
+                        # Do not start observing if this base was just skipped recently
+                        try:
+                            if base_label in self._fruit_skip_until and time.time() < float(self._fruit_skip_until.get(base_label, 0.0)):
+                                raise RuntimeError("observe skipped due to recent skip cooldown")
+                        except Exception:
+                            pass
                         self._observe_label_base = base_label
                         self._observe_label_display = enum_label
                         self._observe_align_start = None
                         self._observe_align_pulse_start = None
+                        self._observe_align_enter_time = None
                         # Alternate spin direction between observations to reduce bias
                         self._observe_align_spin_dir *= -1
                         self._mode = 'observe_align'
@@ -2569,7 +2609,7 @@ if __name__ == "__main__":
     parser.add_argument("--list", type=str, default="")
     parser.add_argument("--grid_res", type=float, default=0.02)
     parser.add_argument("--robot_radius", type=float, default=0.13)
-    parser.add_argument("--safety_margin", type=float, default=0.10)
+    parser.add_argument("--safety_margin", type=float, default=0.11)
     # Merge threshold (main option). You can also use --merge_thresh alias below
     parser.add_argument("--merge_threshold", type=float, default=0.35,
                         help="Merge radius (meters) for clustering detections of the same fruit label")
